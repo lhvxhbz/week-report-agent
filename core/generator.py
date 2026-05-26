@@ -15,6 +15,7 @@ from llm.base import (
     RateLimitError,
     NetworkError,
 )
+from core.template_manager import get_template, list_templates
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,14 @@ def get_week_range(ref_date: Optional[date] = None, days: int = 7) -> str:
 # Template & formatting helpers
 # ---------------------------------------------------------------------------
 
-def _load_template() -> str:
-    """Load the generate prompt template from disk.
+def _load_template(template_name: Optional[str] = None) -> str:
+    """Load the generate prompt template.
+
+    Parameters
+    ----------
+    template_name : str, optional
+        Name of the template to load (e.g. "standard", "concise", "detailed").
+        If None, falls back to the default generate.txt template.
 
     Returns
     -------
@@ -76,6 +83,15 @@ def _load_template() -> str:
     FileNotFoundError
         If the template file does not exist.
     """
+    # If template_name is specified, try to load from template manager
+    if template_name:
+        template_data = get_template(template_name)
+        if template_data is not None:
+            logger.info("Loaded template: %s", template_name)
+            return template_data["template"]
+        logger.warning("Template '%s' not found, falling back to default", template_name)
+
+    # Fall back to default generate.txt
     if not _GENERATE_TEMPLATE_PATH.exists():
         raise FileNotFoundError(
             f"Prompt template not found: {_GENERATE_TEMPLATE_PATH}"
@@ -151,6 +167,7 @@ def generate_report(
     analyses: List[Dict],
     provider: LLMProvider,
     week_range: Optional[str] = None,
+    template_name: Optional[str] = None,
 ) -> str:
     """Generate a weekly report from file analysis results.
 
@@ -164,6 +181,9 @@ def generate_report(
     week_range : str, optional
         Explicit date range string (e.g. ``"05.19 - 05.25"``).
         When *None*, the current week (Monday–Sunday) is calculated automatically.
+    template_name : str, optional
+        Name of the template to use (e.g. "standard", "concise", "detailed").
+        If None, uses the default template from prompts/generate.txt.
 
     Returns
     -------
@@ -185,7 +205,7 @@ def generate_report(
         logger.info("Auto-calculated week range: %s", week_range)
 
     # --- Load template ---
-    template = _load_template()
+    template = _load_template(template_name)
 
     # --- Format analyses (filter failures) ---
     formatted = _format_analyses(analyses)
