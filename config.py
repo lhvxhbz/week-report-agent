@@ -41,6 +41,25 @@ class Config:
     MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "4096"))
     TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.7"))
 
+    # Google Calendar Configuration
+    GOOGLE_CALENDAR_CREDENTIALS_PATH: str = os.getenv("GOOGLE_CALENDAR_CREDENTIALS_PATH", "")
+    GOOGLE_CALENDAR_TOKEN_PATH: str = os.getenv("GOOGLE_CALENDAR_TOKEN_PATH", "")
+    GOOGLE_CALENDAR_ID: str = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+
+    # Feishu (Lark) Configuration
+    FEISHU_APP_ID: str = os.getenv("FEISHU_APP_ID", "")
+    FEISHU_APP_SECRET: str = os.getenv("FEISHU_APP_SECRET", "")
+
+    # Jira Configuration
+    JIRA_URL: str = os.getenv("JIRA_URL", "")
+    JIRA_USERNAME: str = os.getenv("JIRA_USERNAME", "")
+    JIRA_API_TOKEN: str = os.getenv("JIRA_API_TOKEN", "")
+    JIRA_PROJECT_KEY: str = os.getenv("JIRA_PROJECT_KEY", "")
+
+    # Notion Configuration
+    NOTION_TOKEN: str = os.getenv("NOTION_TOKEN", "")
+    NOTION_DATABASE_ID: str = os.getenv("NOTION_DATABASE_ID", "")
+
     @classmethod
     def get_api_key(cls) -> str:
         """Get API key for the configured provider."""
