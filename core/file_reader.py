@@ -4,6 +4,9 @@ Provides scan_folder() to discover recently modified files and read_file()
 to extract content from various file formats.
 """
 
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
@@ -108,6 +111,13 @@ _TEXT_EXTENSIONS = frozenset({
 # Docx extension
 _DOCX_EXTENSIONS = frozenset({".docx"})
 
+# Encoding order: most common first for faster detection
+_ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1")
+
+# Thread-safe encoding cache: maps file_path -> working encoding name
+_ENCODING_CACHE: Dict[str, str] = {}
+_ENCODING_CACHE_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -177,26 +187,30 @@ def scan_folder(folder_path: str, days: int = 7) -> List[Dict]:
         if depth > MAX_DEPTH:
             return
         try:
-            entries = sorted(current.iterdir(), key=lambda e: e.name)
+            entries = sorted(
+                os.scandir(str(current)), key=lambda e: e.name
+            )
         except PermissionError:
+            return
+        except OSError:
             return
 
         for entry in entries:
             try:
-                # Directory handling
-                if entry.is_dir():
+                # Directory handling - use DirEntry.is_dir() (no extra syscall)
+                if entry.is_dir(follow_symlinks=False):
                     if _should_skip_dir(entry.name):
                         continue
-                    _walk(entry, depth + 1)
+                    _walk(Path(entry.path), depth + 1)
                     continue
 
-                # File handling
-                if not entry.is_file():
+                # File handling - use DirEntry.is_file() (no extra syscall)
+                if not entry.is_file(follow_symlinks=False):
                     continue
 
-                # Get file stats once
+                # Get file stats - DirEntry.stat() uses cached info on Windows
                 try:
-                    stat = entry.stat()
+                    stat = entry.stat(follow_symlinks=False)
                     mtime = stat.st_mtime
                     size = stat.st_size
                 except OSError:
@@ -211,11 +225,12 @@ def scan_folder(folder_path: str, days: int = 7) -> List[Dict]:
                     continue
 
                 # Build result
-                ext = entry.suffix.lower()
-                rel = entry.relative_to(root)
+                entry_path = Path(entry.path)
+                ext = entry_path.suffix.lower()
+                rel = entry_path.relative_to(root)
                 results.append(
                     {
-                        "path": str(entry),
+                        "path": entry.path,
                         "name": entry.name,
                         "relative": str(rel),
                         "modified": _format_mtime(mtime),
@@ -285,14 +300,72 @@ def read_file(file_path: str) -> str:
     return f"[Skipped] Unsupported file format: {ext}"
 
 
+def read_files_concurrent(
+    file_paths: List[str],
+    max_workers: int = 4,
+) -> Dict[str, str]:
+    """Read multiple files concurrently using a thread pool.
+
+    Parameters
+    ----------
+    file_paths : list[str]
+        List of file paths to read.
+    max_workers : int
+        Maximum number of concurrent reader threads (default 4).
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping of file_path -> content. Error strings are included as-is.
+    """
+    if not file_paths:
+        return {}
+
+    results: Dict[str, str] = {}
+
+    # Cap workers to number of files
+    effective_workers = min(max_workers, len(file_paths))
+
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        future_to_path = {
+            executor.submit(read_file, fp): fp for fp in file_paths
+        }
+        for future in as_completed(future_to_path):
+            fp = future_to_path[future]
+            try:
+                results[fp] = future.result()
+            except Exception as exc:
+                results[fp] = f"[Error] Unexpected error reading {fp}: {exc}"
+
+    return results
+
+
 def _read_text_file(path: Path) -> str:
-    """Read a text file with encoding fallback."""
-    encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1"]
-    for enc in encodings:
+    """Read a text file with encoding fallback and caching."""
+    path_str = str(path)
+
+    # Check cache first
+    with _ENCODING_CACHE_LOCK:
+        cached_enc = _ENCODING_CACHE.get(path_str)
+
+    if cached_enc is not None:
         try:
-            return path.read_text(encoding=enc)
+            return path.read_text(encoding=cached_enc)
+        except (UnicodeDecodeError, OSError):
+            # Cache miss - encoding no longer valid, fall through
+            pass
+
+    # Try each encoding
+    for enc in _ENCODINGS:
+        try:
+            content = path.read_text(encoding=enc)
+            # Cache the working encoding
+            with _ENCODING_CACHE_LOCK:
+                _ENCODING_CACHE[path_str] = enc
+            return content
         except UnicodeDecodeError:
             continue
         except OSError as exc:
             return f"[Error] Failed to read file: {exc}"
+
     return f"[Error] Unable to decode file with supported encodings: {path}"

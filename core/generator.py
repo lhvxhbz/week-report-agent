@@ -34,27 +34,29 @@ _RETRY_DELAY = 2  # seconds
 # Date helpers
 # ---------------------------------------------------------------------------
 
-def get_week_range(ref_date: Optional[date] = None) -> str:
-    """Calculate the week range string (Monday–Sunday) containing *ref_date*.
+def get_week_range(ref_date: Optional[date] = None, days: int = 7) -> str:
+    """Calculate the date range string from today going back *days* days.
 
     Parameters
     ----------
     ref_date : date, optional
-        Reference date. Defaults to ``date.today()``.
+        Reference date (end date). Defaults to ``date.today()``.
+    days : int
+        Number of days to look back (default 7).
 
     Returns
     -------
     str
-        Formatted as ``"MM.DD - MM.DD"`` (Monday through Sunday).
+        Formatted as ``"MM.DD - MM.DD"`` (start_date - end_date).
     """
     if ref_date is None:
         ref_date = date.today()
 
-    # Monday of the current ISO week (weekday(): Monday=0 … Sunday=6)
-    monday = ref_date - timedelta(days=ref_date.weekday())
-    sunday = monday + timedelta(days=6)
+    # Start date is today minus (days-1) days
+    start_date = ref_date - timedelta(days=days - 1)
+    end_date = ref_date
 
-    return f"{monday.strftime('%m.%d')} - {sunday.strftime('%m.%d')}"
+    return f"{start_date.strftime('%m.%d')} - {end_date.strftime('%m.%d')}"
 
 
 # ---------------------------------------------------------------------------

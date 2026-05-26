@@ -30,7 +30,7 @@ from llm.custom_provider import CustomProvider  # noqa: E402
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="周报终结者 V1",
+    page_title="周报生成器",
     page_icon="📝",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -273,13 +273,13 @@ def _md_to_pdf(md_text: str) -> bytes:
     return bytes(pdf.output())
 
 
-def _get_export_data(report: str, fmt: str) -> Tuple[bytes, str, str]:
+def _get_export_data(report: str, fmt: str, days: int = 7) -> Tuple[bytes, str, str]:
     """Get export data for the selected format.
 
     Returns:
         (data_bytes, filename, mime_type)
     """
-    week_range = get_week_range()
+    week_range = get_week_range(days=days)
     base_name = f"周报_{week_range.replace(' ', '').replace('-', '_')}"
 
     if fmt == "Markdown (.md)":
@@ -433,9 +433,9 @@ with st.sidebar:
         "1. 输入工作目录路径\n"
         "2. 选择扫描天数\n"
         "3. 配置AI模型\n"
-        "4. 点击 **🚀 生成周报**\n"
+        "4. 点击 **🚀 生成工作汇总**\n"
         "5. 等待分析完成\n"
-        "6. 选择格式并下载周报"
+        "6. 选择格式并下载工作汇总"
     )
 
 
@@ -443,8 +443,8 @@ with st.sidebar:
 # Main area: Title
 # ---------------------------------------------------------------------------
 
-st.markdown("# 📝 周报终结者 V1")
-st.caption("自动扫描工作文件，AI生成结构化周报")
+st.markdown("# 📝 周报生成器")
+st.caption("自动扫描工作文件，AI生成结构化工作汇总")
 
 
 # ---------------------------------------------------------------------------
@@ -510,17 +510,20 @@ if st.session_state.scan_done and files is not None:
 
     # -- Generate button --
     if total_files > 0 and has_provider:
-        if st.button("🚀 生成周报", type="primary", use_container_width=True):
+        if st.button("🚀 生成工作汇总", type="primary", use_container_width=True):
             # Phase 1: Analyze files with progress
             st.markdown("### 📊 分析进度")
 
             progress_bar = st.progress(0)
             status_text = st.empty()
 
+            # 使用队列在子线程和主线程之间传递进度
+            import queue
+            progress_queue = queue.Queue()
+
             def _update_progress(current: int, total: int) -> None:
-                pct = current / total
-                progress_bar.progress(pct)
-                status_text.text(f"分析中: {current}/{total} 个文件")
+                """将进度放入队列"""
+                progress_queue.put((current, total))
 
             try:
                 # Create provider based on config mode
@@ -529,17 +532,47 @@ if st.session_state.scan_done and files is not None:
                 else:
                     provider = create_provider(selected_provider_key)
 
-                analyses = analyze_all_files(files, provider, _update_progress)
+                # 在后台线程中执行分析
+                import threading
+                analysis_result = {"analyses": None, "error": None}
 
+                def _run_analysis():
+                    try:
+                        analysis_result["analyses"] = analyze_all_files(files, provider, _update_progress)
+                    except Exception as e:
+                        analysis_result["error"] = e
+
+                analysis_thread = threading.Thread(target=_run_analysis)
+                analysis_thread.start()
+
+                # 主线程更新进度条
+                current, total_done = 0, 0
+                while analysis_thread.is_alive():
+                    try:
+                        current, total_done = progress_queue.get(timeout=0.1)
+                        pct = current / total_done
+                        progress_bar.progress(pct)
+                        status_text.text(f"分析中: {current}/{total_done} 个文件")
+                    except queue.Empty:
+                        pass
+
+                analysis_thread.join()
+
+                # 处理结果
+                if analysis_result["error"]:
+                    raise analysis_result["error"]
+
+                analyses = analysis_result["analyses"]
                 progress_bar.progress(1.0)
                 status_text.text(f"✅ 分析完成: {len(analyses)} 个文件")
 
                 # Phase 2: Generate report
-                with st.spinner("正在生成周报..."):
-                    report = generate_report(analyses, provider)
+                with st.spinner("正在生成工作汇总..."):
+                    week_range = get_week_range(days=scan_days)
+                    report = generate_report(analyses, provider, week_range=week_range)
 
                 st.session_state.report = report
-                st.success("🎉 周报生成完成！")
+                st.success("🎉 工作汇总生成完成！")
 
             except ValueError as exc:
                 st.error(f"配置错误: {exc}")
@@ -557,11 +590,11 @@ if st.session_state.scan_done and files is not None:
     # -- Report preview & download --
     if st.session_state.report:
         st.divider()
-        st.markdown("### 📋 生成的周报")
+        st.markdown("### 📋 生成的工作汇总")
         st.markdown(st.session_state.report)
 
         st.divider()
-        st.markdown("### 📥 导出周报")
+        st.markdown("### 📥 导出工作汇总")
 
         export_format = st.selectbox(
             "选择导出格式",
@@ -571,8 +604,8 @@ if st.session_state.scan_done and files is not None:
         )
 
         # 根据选择的格式生成数据
-        week_range = get_week_range()
-        base_name = f"周报_{week_range.replace(' ', '').replace('-', '_')}"
+        week_range = get_week_range(days=scan_days)
+        base_name = f"近期工作汇总_{week_range.replace(' ', '').replace('-', '_')}"
 
         if export_format == "Markdown (.md)":
             download_data = st.session_state.report.encode("utf-8")
