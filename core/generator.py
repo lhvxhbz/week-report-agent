@@ -99,7 +99,7 @@ def _load_template(template_name: Optional[str] = None) -> str:
     return _GENERATE_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-def _format_analyses(analyses: List[Dict]) -> str:
+def _format_analyses(analyses: List[Dict], file_changes: Optional[Dict] = None) -> str:
     """Format successful analyses into a single string for the template.
 
     Each entry is rendered as a labelled block so the LLM can distinguish
@@ -109,16 +109,89 @@ def _format_analyses(analyses: List[Dict]) -> str:
     ----------
     analyses : list[dict]
         Raw analysis result dicts (from ``analyzer.analyze_all_files``).
+    file_changes : dict, optional
+        File changes information for incremental reports.
+        Can be either:
+        - Per-file format: ``{"file_path": {"added_lines": 10, "removed_lines": 5}}``
+        - Categorized format: ``{"added": [...], "modified": [...], "removed": [...]}``
 
     Returns
     -------
     str
-        Concatenated analysis text, or a placeholder message when empty.
+        Concatenated analysis text with optional change summary, or a
+        placeholder message when empty.
     """
     successful = [a for a in analyses if a.get("status") == "success"]
 
     if not successful:
         return "（暂无文件分析结果）"
+
+    # Build change summary if file_changes provided
+    change_summary = ""
+    if file_changes:
+        summary_parts: List[str] = []
+
+        # Handle per-file format: {"file_path": {"added_lines": N, "removed_lines": N}}
+        if any(isinstance(v, dict) and "added_lines" in v for v in file_changes.values()):
+            summary_parts.append("## 文件变更摘要")
+            for fpath, stats in file_changes.items():
+                added = stats.get("added_lines", 0)
+                removed = stats.get("removed_lines", 0)
+                if added > 0 or removed > 0:
+                    fname = Path(fpath).name
+                    parts = []
+                    if added > 0:
+                        parts.append(f"新增 {added} 行")
+                    if removed > 0:
+                        parts.append(f"删除 {removed} 行")
+                    summary_parts.append(f"- 文件 {fname}（{fpath}）（{'，'.join(parts)}）")
+
+        # Handle categorized format: {"added": [...], "modified": [...], "removed": [...]}
+        elif "added" in file_changes or "modified" in file_changes or "removed" in file_changes:
+            added = file_changes.get("added", [])
+            modified = file_changes.get("modified", [])
+            removed = file_changes.get("removed", [])
+
+            if added or modified or removed:
+                summary_parts.append("## 文件变更摘要")
+                total_added = len(added)
+                total_modified = len(modified)
+                total_removed = len(removed)
+                summary_parts.append(f"本次变更：新增 {total_added} 个文件，修改 {total_modified} 个文件，删除 {total_removed} 个文件")
+                summary_parts.append("")
+
+                if added:
+                    summary_parts.append("### 新增文件")
+                    for f in added[:10]:
+                        fname = f.get("name", "") if isinstance(f, dict) else f
+                        frel = f.get("relative", "") if isinstance(f, dict) else ""
+                        line_info = ""
+                        if isinstance(f, dict) and "added_lines" in f:
+                            line_info = f"（新增 {f['added_lines']} 行）"
+                        summary_parts.append(f"- {fname}（{frel}）{line_info}")
+                    summary_parts.append("")
+
+                if modified:
+                    summary_parts.append("### 修改文件")
+                    for f in modified[:10]:
+                        fname = f.get("name", "") if isinstance(f, dict) else f
+                        frel = f.get("relative", "") if isinstance(f, dict) else ""
+                        line_info = ""
+                        if isinstance(f, dict):
+                            al = f.get("added_lines", 0)
+                            rl = f.get("removed_lines", 0)
+                            if al > 0 or rl > 0:
+                                parts = []
+                                if al > 0:
+                                    parts.append(f"新增 {al} 行")
+                                if rl > 0:
+                                    parts.append(f"删除 {rl} 行")
+                                line_info = f"（{'，'.join(parts)}）"
+                        summary_parts.append(f"- {fname}（{frel}）{line_info}")
+                    summary_parts.append("")
+
+        if summary_parts:
+            change_summary = "\n".join(summary_parts) + "\n\n"
 
     blocks: List[str] = []
     for idx, item in enumerate(successful, start=1):
@@ -132,10 +205,16 @@ def _format_analyses(analyses: List[Dict]) -> str:
 
         blocks.append(f"{header}\n{analysis}")
 
-    return "\n\n".join(blocks)
+    return change_summary + "\n\n".join(blocks)
 
 
-def _build_messages(template: str, week_range: str, analyses: str) -> List[Dict[str, str]]:
+def _build_messages(
+    template: str,
+    week_range: str,
+    analyses: str,
+    previous_report: Optional[str] = None,
+    file_changes: Optional[Dict] = None,
+) -> List[Dict[str, str]]:
     """Build the message list for LLM chat completion.
 
     Parameters
@@ -146,15 +225,104 @@ def _build_messages(template: str, week_range: str, analyses: str) -> List[Dict[
         Date range string (e.g. ``"05.19 - 05.25"``).
     analyses : str
         Pre-formatted analyses text.
+    previous_report : str, optional
+        Previous report content for comparison.
+    file_changes : dict, optional
+        File changes information.
 
     Returns
     -------
     list[dict]
         Messages list suitable for ``provider.chat_completion()``.
     """
+    from datetime import datetime
+    current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    # 构建增量对比信息
+    incremental_info = ""
+    if previous_report:
+        incremental_info += "\n\n## 上次工作汇总（用于对比）\n"
+        incremental_info += "请对比以下上次的工作汇总，重点关注新增和修改的内容，避免重复汇报已完成的工作：\n\n"
+        # 增大限制到5000字符，让LLM完整学习模板内容
+        incremental_info += previous_report[:5000]
+        incremental_info += "\n\n"
+    
+    if file_changes:
+        added = file_changes.get("added", [])
+        modified = file_changes.get("modified", [])
+        removed = file_changes.get("removed", [])
+        
+        if added or modified or removed:
+            incremental_info += "## 本次文件变更情况\n"
+            incremental_info += "以下文件发生了变更，请重点分析这些文件的变化内容：\n\n"
+            
+            if added:
+                incremental_info += f"### 新增文件 ({len(added)} 个)\n"
+                incremental_info += "这些是全新添加的文件，请完整介绍其功能和作用：\n"
+                for f in added[:10]:  # 限制显示数量
+                    fname = f.get("name", "") if isinstance(f, dict) else f
+                    frel = f.get("relative", "") if isinstance(f, dict) else ""
+                    line_info = ""
+                    if isinstance(f, dict) and "added_lines" in f:
+                        line_info = f"，新增 {f['added_lines']} 行"
+                    incremental_info += f"- {fname}（{frel}）{line_info}\n"
+                incremental_info += "\n"
+            
+            if modified:
+                incremental_info += f"### 修改文件 ({len(modified)} 个)\n"
+                incremental_info += "这些是已有文件的修改，请重点关注变更部分，避免重复描述未修改的内容：\n"
+                for f in modified[:10]:
+                    fname = f.get("name", "") if isinstance(f, dict) else f
+                    frel = f.get("relative", "") if isinstance(f, dict) else ""
+                    line_info = ""
+                    if isinstance(f, dict):
+                        al = f.get("added_lines", 0)
+                        rl = f.get("removed_lines", 0)
+                        if al > 0 or rl > 0:
+                            parts = []
+                            if al > 0:
+                                parts.append(f"新增 {al} 行")
+                            if rl > 0:
+                                parts.append(f"删除 {rl} 行")
+                            line_info = f"（{'，'.join(parts)}）"
+                    incremental_info += f"- {fname}（{frel}）{line_info}\n"
+                incremental_info += "\n"
+            
+            if removed:
+                incremental_info += f"### 删除文件 ({len(removed)} 个)\n"
+                incremental_info += "这些文件已被删除，请简要说明删除原因（如重构、功能移除等）：\n"
+                for f in removed[:10]:
+                    fname = f.get("name", "") if isinstance(f, dict) else f
+                    incremental_info += f"- {fname}\n"
+                incremental_info += "\n"
+            
+            incremental_info += "### 分析重点\n"
+            incremental_info += "1. 对于新增文件：完整介绍功能、架构和作用\n"
+            incremental_info += "2. 对于修改文件：仅描述变更内容，不要重复已有功能\n"
+            incremental_info += "3. 对于删除文件：简要说明删除原因和影响\n"
+    
+    # 如果有增量信息，使用更精确的插入方式
+    if incremental_info:
+        # 查找"汇总生成要求"标记的位置（使用行级别匹配）
+        lines = template.split('\n')
+        insert_idx = None
+        for i, line in enumerate(lines):
+            if line.strip().startswith('## 汇总生成要求'):
+                insert_idx = i
+                break
+        
+        if insert_idx is not None:
+            # 在"汇总生成要求"之前插入增量信息
+            lines.insert(insert_idx, incremental_info.rstrip())
+            template = '\n'.join(lines)
+        else:
+            # 如果没有找到标记，在末尾添加
+            template += incremental_info
+    
     prompt = template.format(
         week_range=week_range,
         analyses=analyses,
+        current_date=current_date,
     )
     return [{"role": "user", "content": prompt}]
 
@@ -168,6 +336,8 @@ def generate_report(
     provider: LLMProvider,
     week_range: Optional[str] = None,
     template_name: Optional[str] = None,
+    previous_report: Optional[str] = None,
+    file_changes: Optional[Dict] = None,
 ) -> str:
     """Generate a weekly report from file analysis results.
 
@@ -184,6 +354,10 @@ def generate_report(
     template_name : str, optional
         Name of the template to use (e.g. "standard", "concise", "detailed").
         If None, uses the default template from prompts/generate.txt.
+    previous_report : str, optional
+        Previous report content for comparison and incremental updates.
+    file_changes : dict, optional
+        File changes information with keys: added, modified, removed, unchanged.
 
     Returns
     -------
@@ -208,7 +382,7 @@ def generate_report(
     template = _load_template(template_name)
 
     # --- Format analyses (filter failures) ---
-    formatted = _format_analyses(analyses)
+    formatted = _format_analyses(analyses, file_changes)
     logger.info(
         "Generating report for %d analyses (%d successful)",
         len(analyses),
@@ -216,7 +390,7 @@ def generate_report(
     )
 
     # --- Build messages ---
-    messages = _build_messages(template, week_range, formatted)
+    messages = _build_messages(template, week_range, formatted, previous_report, file_changes)
 
     # --- Call LLM with retry for rate-limit / network errors ---
     last_error: Optional[str] = None
@@ -236,7 +410,15 @@ def generate_report(
                 continue
 
             logger.info("Report generated successfully (%d chars)", len(response))
-            return response.strip()
+            
+            report = response.strip()
+            
+            # 确保日期占位符被替换（LLM可能没有替换）
+            from datetime import datetime
+            current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+            report = report.replace("{current_date}", current_date)
+            
+            return report
 
         except RateLimitError as exc:
             last_error = f"Rate limit exceeded: {exc}"

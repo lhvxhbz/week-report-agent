@@ -136,6 +136,8 @@ def _read_pdf(file_path: Path) -> str:
 def read_file_content(file_path: str) -> str:
     """Read content from various file formats.
     
+    复用 file_reader.read_file() 函数，避免重复造轮子。
+    
     Parameters
     ----------
     file_path : str
@@ -146,30 +148,16 @@ def read_file_content(file_path: str) -> str:
     str
         File content as string, or empty string if failed.
     """
-    path = Path(file_path)
-    if not path.exists():
-        logger.error("File not found: %s", file_path)
+    from core.file_reader import read_file
+    
+    content = read_file(file_path)
+    
+    # read_file 返回错误信息时，返回空字符串
+    if content.startswith("[Error]") or content.startswith("[Skipped]"):
+        logger.warning("Failed to read file %s: %s", file_path, content)
         return ""
     
-    ext = path.suffix.lower()
-    
-    # Handle different file types
-    if ext == '.docx':
-        return _read_docx(path)
-    elif ext == '.pdf':
-        return _read_pdf(path)
-    elif ext in ['.txt', '.md']:
-        try:
-            return path.read_text(encoding='utf-8')
-        except UnicodeDecodeError:
-            try:
-                return path.read_text(encoding='gbk')
-            except Exception as exc:
-                logger.error("Failed to read file %s: %s", file_path, exc)
-                return ""
-    else:
-        logger.warning("Unsupported file format: %s", ext)
-        return ""
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -579,3 +567,205 @@ def extract_template_from_report(report_text: str, name: str) -> Dict:
         "sections": sections,
         "created_at": datetime.now().strftime("%Y-%m-%d"),
     }
+
+
+def analyze_template_with_llm(
+    template_content: str,
+    provider,
+    template_name: str
+) -> Dict:
+    """使用 LLM 分析模板格式并生成优化的模板结构。
+
+    Parameters
+    ----------
+    template_content : str
+        原始模板内容（Markdown 或纯文本）。
+    provider : LLMProvider
+        LLM 提供者实例。
+    template_name : str
+        模板名称。
+
+    Returns
+    -------
+    dict
+        分析后的模板数据，包含：
+        - name: 模板名称
+        - description: 模板描述
+        - template: 优化后的提示词模板
+        - sections: 检测到的章节列表
+        - created_at: 创建时间
+        - analysis: LLM 分析结果
+    """
+    # 构建分析提示词
+    analysis_prompt = f"""你是一个周报模板分析专家。请分析以下模板内容，提取其结构和格式要求。
+
+## 模板内容
+{template_content}
+
+## 分析要求
+
+请按以下格式输出分析结果：
+
+### 模板概述
+简要描述这个模板的用途和特点。
+
+### 章节结构
+列出模板中的主要章节（用逗号分隔）。
+
+### 格式要求
+描述模板的格式要求，包括：
+1. 标题层级
+2. 列表格式
+3. 表格结构（如有）
+4. 特殊标记或符号
+
+### 优化建议
+提供模板优化建议，使其更适合AI生成工作汇总。
+
+### 提示词模板
+基于分析结果，生成一个优化的提示词模板，包含以下占位符：
+- {{week_range}}: 日期范围
+- {{analyses}}: 文件分析结果
+
+请确保提示词模板能够引导AI按照原模板的结构生成工作汇总。
+
+## 注意事项
+- 保持原模板的核心结构
+- 优化语言使其更适合AI理解
+- 确保生成的内容专业、简洁
+"""
+
+    try:
+        # 调用 LLM 进行分析
+        messages = [{"role": "user", "content": analysis_prompt}]
+        response = provider.chat_completion(
+            messages=messages,
+            temperature=0.3,
+            max_tokens=2048,
+        )
+
+        if not response or not response.strip():
+            logger.warning("LLM 返回空响应")
+            return _fallback_template_extraction(template_content, template_name)
+
+        analysis_result = response.strip()
+
+        # 从分析结果中提取章节
+        sections = _extract_sections_from_analysis(analysis_result)
+
+        # 从分析结果中提取提示词模板
+        prompt_template = _extract_prompt_template(analysis_result, template_content)
+
+        return {
+            "name": template_name,
+            "description": f"LLM 分析优化的模板 - {template_name}",
+            "template": prompt_template,
+            "sections": sections,
+            "created_at": datetime.now().strftime("%Y-%m-%d"),
+            "analysis": analysis_result,
+        }
+
+    except Exception as e:
+        logger.error("LLM 模板分析失败: %s", e)
+        return _fallback_template_extraction(template_content, template_name)
+
+
+def _extract_sections_from_analysis(analysis_text: str) -> List[str]:
+    """从 LLM 分析结果中提取章节列表。"""
+    sections = []
+    in_sections = False
+
+    for line in analysis_text.split('\n'):
+        stripped = line.strip()
+
+        # 查找章节结构部分
+        if '章节结构' in stripped or '章節結構' in stripped:
+            in_sections = True
+            continue
+
+        if in_sections:
+            # 遇到下一个标题时停止
+            if stripped.startswith('###') or stripped.startswith('##'):
+                break
+
+            # 提取章节名称
+            if stripped and not stripped.startswith('#'):
+                # 移除序号和标点
+                import re
+                cleaned = re.sub(r'^[\d\.\-\*\s]+', '', stripped)
+                cleaned = cleaned.strip('，。、；：')
+                if cleaned:
+                    sections.extend([s.strip() for s in cleaned.split('，') if s.strip()])
+
+    return sections
+
+
+def _extract_prompt_template(analysis_text: str, original_content: str) -> str:
+    """从 LLM 分析结果中提取提示词模板。"""
+    import re
+
+    # 尝试查找 "提示词模板" 部分
+    in_template = False
+    template_lines = []
+
+    for line in analysis_text.split('\n'):
+        stripped = line.strip()
+
+        if '提示词模板' in stripped or '提示詞模板' in stripped:
+            in_template = True
+            continue
+
+        if in_template:
+            # 遇到下一个标题时停止
+            if stripped.startswith('###') or stripped.startswith('##'):
+                break
+
+            template_lines.append(line)
+
+    if template_lines:
+        extracted = '\n'.join(template_lines).strip()
+        # 确保包含必要的占位符
+        if '{week_range}' not in extracted:
+            extracted = f"## 汇总日期范围\n{{week_range}}\n\n{extracted}"
+        if '{analyses}' not in extracted:
+            extracted = f"{extracted}\n\n## 文件分析结果\n{{analyses}}"
+        return extracted
+
+    # 如果无法提取，使用原始内容构建
+    return _build_template_from_content(original_content)
+
+
+def _build_template_from_content(content: str) -> str:
+    """从原始内容构建提示词模板。"""
+    return f"""你是一个工作汇总助手。请根据以下文件分析结果，生成一份结构化的工作汇总。
+
+## 汇总日期范围
+{{week_range}}
+
+## 文件分析结果
+{{analyses}}
+
+## 模板格式要求
+
+请严格按照以下格式生成工作汇总：
+
+{content}
+
+## 生成规则
+
+1. **归类整理**：将相关文件的分析结果归类到同一模块，不要按文件逐个罗列
+2. **突出重点**：重点写成果和进展，不要写流水账
+3. **语言专业**：用专业的职场语言描述，适当包装工作成果
+4. **格式规范**：严格按照上述Markdown格式输出，确保可解析
+5. **处理空内容**：如果某个部分没有相关内容，使用默认描述（如"暂无"）
+
+## 注意事项
+- 不要编造没有依据的内容
+- 不要输出代码片段
+- 保持客观真实，基于提供的分析结果生成"""
+
+
+def _fallback_template_extraction(content: str, name: str) -> Dict:
+    """当 LLM 分析失败时的备用模板提取方法。"""
+    # 使用原有的 extract_template_from_report 逻辑
+    return extract_template_from_report(content, name)

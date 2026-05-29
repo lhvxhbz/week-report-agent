@@ -4,12 +4,13 @@ Provides scan_folder() to discover recently modified files and read_file()
 to extract content from various file formats.
 """
 
+import hashlib
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -111,6 +112,12 @@ _TEXT_EXTENSIONS = frozenset({
 # Docx extension
 _DOCX_EXTENSIONS = frozenset({".docx"})
 
+# PDF extension
+_PDF_EXTENSIONS = frozenset({".pdf"})
+
+# Excel extensions
+_EXCEL_EXTENSIONS = frozenset({".xlsx", ".xls"})
+
 # Encoding order: most common first for faster detection
 _ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1")
 
@@ -156,19 +163,83 @@ def _read_docx(file_path: Path) -> str:
         return f"[Error] Failed to read docx file: {exc}"
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _read_pdf(file_path: Path) -> str:
+    """Read a .pdf file using PyPDF2. Returns plain text content."""
+    try:
+        from PyPDF2 import PdfReader
+
+        reader = PdfReader(str(file_path))
+        text_parts = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                text_parts.append(text)
+        return "\n\n".join(text_parts)
+    except ImportError:
+        return "[Error] PyPDF2 is not installed. Run: pip install PyPDF2"
+    except Exception as exc:
+        return f"[Error] Failed to read PDF file: {exc}"
+
+
+def _read_excel(file_path: Path) -> str:
+    """Read an .xlsx/.xls file using openpyxl. Returns text representation."""
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(str(file_path), read_only=True, data_only=True)
+        text_parts = []
+        for sheet_name in wb.sheetnames:
+            sheet = wb[sheet_name]
+            text_parts.append(f"## Sheet: {sheet_name}")
+            for row in sheet.iter_rows(values_only=True):
+                row_text = "\t".join(
+                    str(cell) if cell is not None else "" for cell in row
+                )
+                if row_text.strip():
+                    text_parts.append(row_text)
+        wb.close()
+        return "\n".join(text_parts)
+    except ImportError:
+        return "[Error] openpyxl is not installed. Run: pip install openpyxl"
+    except Exception as exc:
+        return f"[Error] Failed to read Excel file: {exc}"
+
+
+def get_file_hash(file_path: str) -> str:
+    """根据文件路径和修改时间生成哈希值，用于变更检测。
+
+    Parameters
+    ----------
+    file_path : str
+        文件路径。
+
+    Returns
+    -------
+    str
+        文件的哈希值（MD5）。
+    """
+    try:
+        stat = os.stat(file_path)
+        # 使用路径 + 修改时间 + 文件大小作为缓存键
+        key = f"{file_path}:{stat.st_mtime}:{stat.st_size}"
+        return hashlib.md5(key.encode()).hexdigest()
+    except OSError:
+        return hashlib.md5(file_path.encode()).hexdigest()
+
 
 def scan_folder(folder_path: str, days: int = 7) -> List[Dict]:
-    """Scan a folder and return files modified within the last *days* days.
+    """Scan a folder and return files modified within the last *days* calendar days.
+
+    "days" means calendar days, not 24-hour periods.
+    For example, if today is May 28 and days=1, it scans files from May 27 00:00 to May 27 23:59.
+    If days=7, it scans files from May 21 00:00 to May 27 23:59.
 
     Parameters
     ----------
     folder_path : str
         Absolute or relative path to the folder to scan.
     days : int
-        Number of days to look back (default 7).
+        Number of calendar days to look back (default 7).
 
     Returns
     -------
@@ -179,7 +250,12 @@ def scan_folder(folder_path: str, days: int = 7) -> List[Dict]:
     if not root.is_dir():
         return []
 
-    cutoff = datetime.now() - timedelta(days=days)
+    # 计算日历天数的截止时间：days天前的0点
+    # 例如：今天5月28日，days=1 -> 5月27日00:00:00
+    # 例如：今天5月28日，days=7 -> 5月21日00:00:00
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today_start - timedelta(days=days - 1)
     cutoff_ts = cutoff.timestamp()
     results: List[Dict] = []
 
@@ -218,6 +294,87 @@ def scan_folder(folder_path: str, days: int = 7) -> List[Dict]:
 
                 # Skip files older than cutoff
                 if mtime < cutoff_ts:
+                    continue
+
+                # Skip files exceeding max size
+                if size > MAX_FILE_SIZE:
+                    continue
+
+                # Build result
+                entry_path = Path(entry.path)
+                ext = entry_path.suffix.lower()
+                rel = entry_path.relative_to(root)
+                results.append(
+                    {
+                        "path": entry.path,
+                        "name": entry.name,
+                        "relative": str(rel),
+                        "modified": _format_mtime(mtime),
+                        "size": size,
+                        "ext": ext,
+                    }
+                )
+            except PermissionError:
+                continue
+            except OSError:
+                continue
+
+    _walk(root, depth=0)
+    return results
+
+
+def scan_folder_all(folder_path: str) -> List[Dict]:
+    """Scan a folder and return ALL files (no time filter).
+
+    Used for displaying the complete file list in the UI.
+
+    Parameters
+    ----------
+    folder_path : str
+        Absolute or relative path to the folder to scan.
+
+    Returns
+    -------
+    list[dict]
+        Each dict contains: path, name, relative, modified, size, ext.
+    """
+    root = Path(folder_path).resolve()
+    if not root.is_dir():
+        return []
+
+    results: List[Dict] = []
+
+    def _walk(current: Path, depth: int) -> None:
+        if depth > MAX_DEPTH:
+            return
+        try:
+            entries = sorted(
+                os.scandir(str(current)), key=lambda e: e.name
+            )
+        except PermissionError:
+            return
+        except OSError:
+            return
+
+        for entry in entries:
+            try:
+                # Directory handling
+                if entry.is_dir(follow_symlinks=False):
+                    if _should_skip_dir(entry.name):
+                        continue
+                    _walk(Path(entry.path), depth + 1)
+                    continue
+
+                # File handling
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+
+                # Get file stats
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                    mtime = stat.st_mtime
+                    size = stat.st_size
+                except OSError:
                     continue
 
                 # Skip files exceeding max size
@@ -292,6 +449,14 @@ def read_file(file_path: str) -> str:
     # Handle .docx
     if ext in _DOCX_EXTENSIONS:
         return _read_docx(path)
+
+    # Handle .pdf
+    if ext in _PDF_EXTENSIONS:
+        return _read_pdf(path)
+
+    # Handle .xlsx / .xls
+    if ext in _EXCEL_EXTENSIONS:
+        return _read_excel(path)
 
     # Handle text-based files
     if ext in _TEXT_EXTENSIONS or ext == "":

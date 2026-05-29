@@ -42,3 +42,15 @@ Thumbs.db
 
 # Streamlit
 .streamlit/
+
+# IDE History
+.history/
+
+# OpenCode
+.omo/
+
+# Scheduler Config
+.scheduler_config.json
+
+# Cache
+.cache/

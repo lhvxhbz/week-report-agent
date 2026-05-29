@@ -1,12 +1,18 @@
 """周报终结者 V1 - Streamlit Web界面."""
 
 import io
+import json
+import logging
+import queue
 import re
 import sys
+from datetime import datetime, time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 # Ensure project root is on sys.path so local imports work
 _project_root = str(Path(__file__).resolve().parent)
@@ -14,9 +20,20 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from config import Config  # noqa: E402
-from core.file_reader import scan_folder  # noqa: E402
-from core.analyzer import analyze_all_files  # noqa: E402
+from core.file_reader import scan_folder, scan_folder_all, get_file_hash, read_file  # noqa: E402
+from core.analyzer import analyze_all_files, analyze_changes  # noqa: E402
+from core.diff_extractor import get_file_diff, compare_file_contents  # noqa: E402
 from core.generator import generate_report, get_week_range  # noqa: E402
+from core.history import (  # noqa: E402
+    save_snapshot,
+    get_latest_snapshot,
+    list_snapshots,
+    compare_with_latest,
+    delete_snapshot,
+    clear_old_snapshots,
+    get_snapshot_file_contents,
+    get_timeline_summary,
+)
 from core.template_manager import (  # noqa: E402
     list_templates,
     get_template,
@@ -30,6 +47,7 @@ from llm.factory import (  # noqa: E402
     PROVIDER_DISPLAY_NAMES,
 )
 from llm.custom_provider import CustomProvider  # noqa: E402
+from core.scheduler import AutoScheduler  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +147,7 @@ DESIGN_SYSTEM_CSS = """
         min-height: 100vh;
     }
 
-    /* Animated background mesh */
+    /* Animated background mesh - DISABLED to prevent flickering
     .stApp::before {
         content: '';
         position: fixed;
@@ -154,6 +172,7 @@ DESIGN_SYSTEM_CSS = """
         z-index: 0;
         animation: floatOrb2 30s ease-in-out infinite;
     }
+    */
     @keyframes floatOrb1 {
         0%, 100% { transform: translate(0, 0) scale(1); }
         33% { transform: translate(-40px, 30px) scale(1.05); }
@@ -197,7 +216,6 @@ DESIGN_SYSTEM_CSS = """
         height: 500px;
         background: radial-gradient(circle, rgba(251, 191, 36, 0.18) 0%, rgba(251, 191, 36, 0.05) 40%, transparent 70%);
         pointer-events: none;
-        animation: heroGlow1 20s ease-in-out infinite;
     }
     .hero-banner::after {
         content: '';
@@ -208,7 +226,6 @@ DESIGN_SYSTEM_CSS = """
         height: 400px;
         background: radial-gradient(circle, rgba(129, 140, 248, 0.25) 0%, rgba(99, 102, 241, 0.08) 40%, transparent 70%);
         pointer-events: none;
-        animation: heroGlow2 18s ease-in-out infinite;
     }
     @keyframes heroGlow1 {
         0%, 100% { transform: translate(0, 0); opacity: 1; }
@@ -1729,6 +1746,25 @@ def _svg_icon(name: str, size: str = "md", extra_class: str = "") -> str:
             <path d="M4 5V19C4 20.66 7.58 22 12 22S20 20.66 20 19V5" stroke="url(#dbG)" stroke-width="1.3"/>
             <path d="M4 12C4 13.66 7.58 15 12 15S20 13.66 20 12" stroke="url(#dbG)" stroke-width="1.3"/>
         </svg>''',
+
+        # ── Shield / OAuth lock ──
+        "shield": '''<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs><linearGradient id="shdG" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#6366F1"/><stop offset="100%" stop-color="#818CF8"/>
+            </linearGradient></defs>
+            <path d="M12 2L3 7V12C3 17.55 7.84 22.74 12 24C16.16 22.74 21 17.55 21 12V7L12 2Z" stroke="url(#shdG)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M8 12L10.5 14.5L16 9" stroke="url(#shdG)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>''',
+
+        # ── External link ──
+        "externalLink": '''<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs><linearGradient id="elG" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#6366F1"/><stop offset="100%" stop-color="#818CF8"/>
+            </linearGradient></defs>
+            <path d="M18 13V19C18 20.1 17.1 21 16 21H5C3.9 21 3 20.1 3 19V8C3 6.9 3.9 6 5 6H11" stroke="url(#elG)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M15 3H21V9" stroke="url(#elG)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M10 14L21 3" stroke="url(#elG)" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>''',
     }
 
     svg = icons.get(name, icons["file"])
@@ -1852,14 +1888,20 @@ def _md_to_docx(md_text: str) -> bytes:
         elif stripped.startswith("- ") or stripped.startswith("* "):
             text = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped[2:])
             text = re.sub(r"\*(.+?)\*", r"\1", text)
+            # 处理来源链接
+            text = _process_source_links_for_docx(text)
             doc.add_paragraph(text, style="List Bullet")
         elif re.match(r"^\d+\.\s", stripped):
             text = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped)
             text = re.sub(r"\d+\.\s", "", text, count=1)
+            # 处理来源链接
+            text = _process_source_links_for_docx(text)
             doc.add_paragraph(text, style="List Number")
         else:
             text = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped)
             text = re.sub(r"\*(.+?)\*", r"\1", text)
+            # 处理来源链接
+            text = _process_source_links_for_docx(text)
             doc.add_paragraph(text)
 
     # Flush any remaining table
@@ -1870,6 +1912,17 @@ def _md_to_docx(md_text: str) -> bytes:
     doc.save(buf)
     buf.seek(0)
     return buf.getvalue()
+
+
+def _process_source_links_for_docx(text: str) -> str:
+    """处理 Markdown 文本中的来源链接，使其在 Word 文档中正确显示。
+
+    将 [path](file:///path) 格式的链接转换为纯文本显示。
+    """
+    import re
+    # 将 [text](file:///path) 转换为 "text"
+    text = re.sub(r'\[([^\]]+)\]\(file:///[^\)]+\)', r'\1', text)
+    return text
 
 
 def _add_table_to_doc(doc, rows: List[List[str]]) -> None:
@@ -1976,6 +2029,9 @@ def _md_to_pdf(md_text: str) -> bytes:
         # Remove markdown formatting for PDF
         text = re.sub(r"\*\*(.+?)\*\*", r"\1", stripped)
         text = re.sub(r"\*(.+?)\*", r"\1", text)
+        
+        # 处理来源链接 - 将 [text](file:///path) 转换为纯文本
+        text = re.sub(r'\[([^\]]+)\]\(file:///[^\)]+\)', r'\1', text)
 
         if stripped.startswith("# "):
             write_text(text[2:].strip(), size=16, bold=True)
@@ -2066,6 +2122,175 @@ def _get_template_display_name() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Data source helpers
+# ---------------------------------------------------------------------------
+
+# Canonical mapping: display name -> source key
+DATASOURCE_OPTIONS = {
+    "📁 本地文件": "file",
+}
+
+
+def _create_datasource(source_key: str):
+    """Create a DataSource instance based on session_state config.
+
+    Returns the DataSource instance, or ``None`` for the ``"file"`` source
+    (which is handled separately via ``scan_folder``).
+    """
+    if source_key == "file":
+        return None  # Handled by existing scan_folder flow
+
+    return None
+
+
+def _fetch_all_data(selected_sources: List[str], days: int) -> List[Dict]:
+    """Fetch work items from all selected non-file data sources.
+
+    The ``"file"`` source is handled separately via ``scan_folder`` in the
+    main generation flow.  This function only fetches from API-based sources.
+
+    Parameters
+    ----------
+    selected_sources : list[str]
+        Display names of selected sources (e.g. ``["📁 本地文件", "🔀 Git提交记录"]``).
+    days : int
+        Number of days of history to retrieve.
+
+    Returns
+    -------
+    list[dict]
+        Combined list of standardised items from all non-file sources.
+    """
+    all_items: List[Dict] = []
+
+    for source_name in selected_sources:
+        source_key = DATASOURCE_OPTIONS.get(source_name)
+        if source_key is None or source_key == "file":
+            continue
+
+        source = _create_datasource(source_key)
+        if source is None:
+            logger.warning("Skipping %s: configuration incomplete", source_name)
+            continue
+
+        if not source.is_available():
+            logger.warning("Skipping %s: source not available", source_name)
+            st.warning(f"⚠️ {source_name} 不可用，已跳过")
+            continue
+
+        try:
+            items = source.fetch(days=days)
+            logger.info("Fetched %d items from %s", len(items), source_name)
+            all_items.extend(items)
+        except Exception as exc:
+            logger.error("Failed to fetch from %s: %s", source_name, exc)
+            st.warning(f"⚠️ {source_name} 获取数据失败: {exc}")
+
+    return all_items
+
+
+# ---------------------------------------------------------------------------
+# OAuth / Connection-test helpers
+# ---------------------------------------------------------------------------
+
+# Auth type classification
+NO_AUTH_SOURCES = {"file"}
+
+# Human-readable auth type labels
+AUTH_TYPE_LABELS = {
+    "file": "无需授权",
+}
+
+
+def _test_datasource_connection(source_key: str) -> Tuple[bool, str]:
+    """Test connection for a given data source.
+
+    Returns (success: bool, message: str).
+    """
+    try:
+        source = _create_datasource(source_key)
+        if source is None:
+            return False, "配置不完整，请填写所有必填字段"
+        if source.is_available():
+            return True, "连接成功"
+        return False, "数据源不可用，请检查配置"
+    except ImportError as e:
+        return False, f"缺少依赖: {e}"
+    except Exception as e:
+        return False, f"连接失败: {e}"
+
+
+def _get_sensitivity_warnings(selected_sources: List[str]) -> List[str]:
+    """Collect sensitivity warnings from all selected data sources.
+
+    Returns
+    -------
+    list[str]
+        Non-empty warning strings.
+    """
+    warnings: List[str] = []
+    for source_name in selected_sources:
+        source_key = DATASOURCE_OPTIONS.get(source_name)
+        if source_key is None or source_key == "file":
+            continue
+
+        source = _create_datasource(source_key)
+        if source is None:
+            continue
+
+        try:
+            warning = source.get_sensitivity_warning()
+            if warning:
+                warnings.append(f"{source_name}: {warning}")
+        except Exception:
+            pass
+
+    return warnings
+
+
+def _convert_items_to_analyses(items: List[Dict]) -> List[Dict]:
+    """Convert data-source items into the analysis format expected by the generator.
+
+    Each data-source item has keys: source_type, title, content, metadata, timestamp.
+    The generator expects dicts with: file_name, file_path, analysis, status.
+
+    Parameters
+    ----------
+    items : list[dict]
+        Standardised items from data sources.
+
+    Returns
+    -------
+    list[dict]
+        Analysis-format dicts compatible with ``generate_report``.
+    """
+    analyses: List[Dict] = []
+    for item in items:
+        source_type = item.get("source_type", "unknown")
+        title = item.get("title", "(无标题)")
+        content = item.get("content", "")
+        timestamp = item.get("timestamp", "")
+
+        # Build analysis text from the item's content
+        analysis_parts = []
+        if content:
+            analysis_parts.append(content)
+        if timestamp:
+            analysis_parts.append(f"时间: {timestamp}")
+
+        analysis_text = "\n".join(analysis_parts)
+
+        analyses.append({
+            "file_name": f"[{source_type}] {title}",
+            "file_path": source_type,
+            "analysis": analysis_text,
+            "status": "success",
+        })
+
+    return analyses
+
+
+# ---------------------------------------------------------------------------
 # Session state defaults
 # ---------------------------------------------------------------------------
 
@@ -2100,6 +2325,175 @@ if "use_cache" not in st.session_state:
     st.session_state.use_cache = True
 if "log_level" not in st.session_state:
     st.session_state.log_level = "INFO"
+if "selected_sources" not in st.session_state:
+    st.session_state.selected_sources = ["📁 本地文件"]
+
+# OAuth / Connection status tracking
+if "source_connection_status" not in st.session_state:
+    st.session_state.source_connection_status = {}  # {source_key: {"ok": bool, "msg": str}}
+
+# 时间线/历史记录相关
+if "file_changes" not in st.session_state:
+    st.session_state.file_changes = None  # 文件变更信息
+if "show_timeline" not in st.session_state:
+    st.session_state.show_timeline = False  # 是否显示时间线
+if "save_snapshot_on_generate" not in st.session_state:
+    st.session_state.save_snapshot_on_generate = True  # 生成报告时自动保存快照
+
+# ---------------------------------------------------------------------------
+# Auto-detect available AI models at startup
+# ---------------------------------------------------------------------------
+if st.session_state.get("selected_provider_key") is None:
+    try:
+        _providers, _mapping = _get_provider_choices()
+        if _providers:
+            st.session_state.selected_provider_key = _mapping[_providers[0]]
+    except Exception:
+        pass  # Silently skip if detection fails
+
+# ---------------------------------------------------------------------------
+# Auto-scan callback
+# ---------------------------------------------------------------------------
+
+def auto_scan_callback():
+    """自动扫描回调函数 - 在后台线程中执行扫描、分析、生成报告并保存快照.
+    从 .scheduler_config.json 读取配置，不依赖 st.session_state。"""
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan callback started")
+    # 从配置文件读取扫描配置（后台线程无法访问 st.session_state）
+    scheduler = AutoScheduler()
+    scan_cfg = scheduler.load_scan_config()
+
+    work_dir = scan_cfg.get("work_dir", "")
+    scan_days = scan_cfg.get("scan_days", 7)
+    selected_template = scan_cfg.get("selected_template")
+    config_mode = scan_cfg.get("config_mode", "使用 .env 配置")
+    selected_provider_key = scan_cfg.get("selected_provider_key")
+    retention_days = scan_cfg.get("retention_days", 30)
+
+    if not work_dir:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan skipped: no work_dir configured")
+        logger.warning("自动扫描跳过: 未设置工作目录")
+        return
+
+    try:
+        # 1. 扫描文件
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: scanning {work_dir} for last {scan_days} days")
+        files = scan_folder(work_dir, days=scan_days)
+        if not files:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan completed: no files found")
+            logger.info("自动扫描完成: 未发现文件")
+            return
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: found {len(files)} files")
+        logger.info("自动扫描: 发现 %d 个文件", len(files))
+
+        # 2. 创建 LLM provider
+        provider = None
+        if config_mode == "手动配置":
+            base_url = scan_cfg.get("manual_base_url", "")
+            api_key = scan_cfg.get("manual_api_key", "")
+            model_name = scan_cfg.get("manual_model_name", "")
+            if base_url and model_name:
+                provider = CustomProvider(
+                    api_key=api_key,
+                    model=model_name,
+                    base_url=base_url,
+                )
+        else:
+            if selected_provider_key:
+                provider = create_provider(selected_provider_key)
+
+        if provider is None:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan skipped: no AI model configured")
+            logger.warning("自动扫描跳过: 未配置 AI 模型")
+            return
+
+        # 3. 获取历史快照内容用于增量分析
+        _snapshot = get_latest_snapshot()
+        _old_file_contents = get_snapshot_file_contents(_snapshot)
+
+        # 4. 逐文件分析
+        analyses = []
+        for file_info in files:
+            file_path = file_info.get("path", "")
+            old_content = _old_file_contents.get(file_path)
+            new_content = read_file(file_path)
+            if new_content.startswith("[Error]") or new_content.startswith("[Skipped]"):
+                old_content = None
+            result = analyze_changes(file_info, provider, old_content, new_content)
+            analyses.append(result)
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: analysis completed for {len(analyses)} files")
+        logger.info("自动扫描: 分析完成 %d 个文件", len(analyses))
+
+        # 5. 生成报告
+        week_range = get_week_range(days=scan_days)
+        previous_report = None
+        latest_snapshot = get_latest_snapshot()
+        if latest_snapshot and latest_snapshot.get("report"):
+            previous_report = latest_snapshot["report"]
+
+        report = generate_report(
+            analyses,
+            provider,
+            week_range=week_range,
+            template_name=selected_template,
+            previous_report=previous_report,
+            file_changes=compare_with_latest(files, scan_days),
+        )
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: report generated")
+        logger.info("自动扫描: 报告生成完成")
+
+        # 6. 保存快照
+        snapshot_id = save_snapshot(
+            files=files,
+            analyses=analyses,
+            report=report,
+            metadata={
+                "scan_days": scan_days,
+                "work_dir": work_dir,
+                "template": selected_template,
+                "retention_days": retention_days,
+                "auto_generated": True,
+            }
+        )
+        if snapshot_id:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: snapshot saved {snapshot_id}")
+            logger.info("自动扫描: 快照已保存 %s", snapshot_id)
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan all steps completed successfully")
+
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan error: {e}")
+        logger.error("自动扫描出错: %s", e, exc_info=True)
+        import traceback
+        traceback.print_exc()
+
+
+# 初始化调度器
+if "auto_scheduler" not in st.session_state:
+    st.session_state.auto_scheduler = AutoScheduler()
+
+# 从配置文件加载自动扫描设置到 session_state（确保刷新页面后设置不丢失）
+_scheduler = st.session_state.auto_scheduler
+if "auto_scan_enabled" not in st.session_state:
+    st.session_state.auto_scan_enabled = _scheduler.enabled
+    # 解析时间字符串
+    try:
+        _hour, _minute = _scheduler.time_str.split(":")
+        st.session_state.auto_scan_hour = int(_hour)
+        st.session_state.auto_scan_minute = int(_minute)
+    except (ValueError, AttributeError):
+        st.session_state.auto_scan_hour = 9
+        st.session_state.auto_scan_minute = 0
+    print(f"[Scheduler Init] Loaded from config: enabled={_scheduler.enabled}, time={_scheduler.time_str}")
+
+# 应用启动时，如果调度器配置为启用则自动启动
+if _scheduler.enabled and not _scheduler.running:
+    _scheduler.set_callback(auto_scan_callback)
+    _scheduler.start()
+    print(f"[Scheduler Init] Scheduler auto-started, scheduled time: {_scheduler.time_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -2166,22 +2560,56 @@ def main_page():
                     st.error(f"目录不存在: {resolved}")
                 else:
                     with st.spinner("正在扫描文件..."):
-                        files = scan_folder(work_dir, days=scan_days)
-                    st.session_state.files = files
+                        # 获取所有文件（用于显示）
+                        all_files = scan_folder_all(work_dir)
+                        # 获取待分析文件（仅最近N天修改的）
+                        files_to_analyze = scan_folder(work_dir, days=scan_days)
+                    
+                    st.session_state.files = all_files  # 显示所有文件
+                    st.session_state.files_to_analyze = files_to_analyze  # 待分析文件
                     st.session_state.scan_done = True
                     st.session_state.report = None  # Reset report on new scan
+                    
+                    # 先进行变更检测（与历史快照比较，使用待分析文件）
+                    changes = compare_with_latest(files_to_analyze, scan_days)
+                    st.session_state.file_changes = changes
+                    
+                    # 再保存当前扫描快照（用于下次对比，保存待分析文件）
+                    save_snapshot(
+                        files=files_to_analyze,
+                        analyses=[],
+                        report=None,
+                        metadata={
+                            "scan_days": scan_days,
+                            "work_dir": work_dir,
+                            "scan_only": True,
+                            "retention_days": st.session_state.get("retention_days", 30),
+                        }
+                    )
+                    
+                    # 变更信息在下方扫描统计区域统一显示，此处不重复显示
 
     # Close the card div (the card-header was opened above, content is outside)
     # We need to close the card properly - using container border instead
 
     # -- Stats & File list (after scan) --
     files = st.session_state.files
+    files_to_analyze = st.session_state.get("files_to_analyze", [])
 
     if st.session_state.scan_done and files is not None:
         total_files = len(files)
         total_size = sum(f["size"] for f in files)
+        analyze_count = len(files_to_analyze)
 
-        # -- Stats cards (custom HTML) --
+        # 获取变更信息
+        changes = st.session_state.file_changes or {}
+        added_count = len(changes.get("added", []))
+        modified_count = len(changes.get("modified", []))
+        removed_count = len(changes.get("removed", []))
+        has_previous = changes.get("has_previous", False)
+        found_match = changes.get("found_match", False)
+        nearest_snapshot_time = changes.get("nearest_snapshot_time", "")
+
         st.markdown(
             f"""
             <div class="card">
@@ -2189,39 +2617,57 @@ def main_page():
                     <span class="card-header-icon">{_svg_icon("chart", size="md")}</span>
                     <span class="card-header-title">扫描统计</span>
                 </div>
-                <div class="stat-grid">
-                    <div class="stat-card">
-                        <div class="stat-icon">{_svg_icon("file", size="lg")}</div>
-                        <div class="stat-value">{total_files}</div>
-                        <div class="stat-label">文件数</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">{_svg_icon("clock", size="lg")}</div>
-                        <div class="stat-value">{scan_days}</div>
-                        <div class="stat-label">扫描天数</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">{_svg_icon("storage", size="lg")}</div>
-                        <div class="stat-value">{_human_size(total_size)}</div>
-                        <div class="stat-label">总大小</div>
-                    </div>
-                </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        
+        # 使用 Streamlit 原生组件显示统计信息
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📄 总文件数", total_files)
+        with col2:
+            st.metric("📊 待分析", analyze_count)
+        with col3:
+            st.metric("📅 扫描天数", scan_days)
+        with col4:
+            st.metric("💾 总大小", _human_size(total_size))
+        
+        # 如果有变更，显示变更统计
+        if has_previous and found_match:
+            if added_count or modified_count:
+                st.info(f"📊 变更检测（对比 {scan_days} 天前）：新增 {added_count} 个，修改 {modified_count} 个文件")
+            if not added_count and not modified_count:
+                st.info(f"📊 与 {scan_days} 天前相比无变化")
+        elif has_previous and not found_match:
+            st.warning(f"⚠️ 未找到 {scan_days} 天前的历史记录，所有文件将作为新增内容处理")
+        elif not has_previous:
+            st.info("📝 首次扫描，已保存为基准记录")
 
         # -- File list (expandable) --
         if total_files > 0:
+            # 构建变更文件集合
+            added_files = {f["path"] for f in changes.get("added", [])}
+            modified_files = {f["path"] for f in changes.get("modified", [])}
+            
             with st.expander(f"📄 文件列表 · {total_files} 个文件", expanded=False):
                 for f in files:
                     icon = _file_icon(f["ext"])
+                    file_path = f.get("path", "")
+                    
+                    # 添加变更标记
+                    change_badge = ""
+                    if file_path in added_files:
+                        change_badge = '<span style="background:#10B981;color:white;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:999px;margin-left:0.5rem;">新增</span>'
+                    elif file_path in modified_files:
+                        change_badge = '<span style="background:#F59E0B;color:white;font-size:0.65rem;padding:0.1rem 0.4rem;border-radius:999px;margin-left:0.5rem;">修改</span>'
+                    
                     st.markdown(
                         f"""
                         <div class="file-item">
                             <div class="file-item-icon">{icon}</div>
                             <div>
-                                <div class="file-item-name">{f['name']}</div>
+                                <div class="file-item-name">{f['name']}{change_badge}</div>
                                 <div class="file-item-meta">{f['relative']} · {_human_size(f['size'])} · {f['modified']}</div>
                             </div>
                         </div>
@@ -2257,42 +2703,47 @@ def main_page():
             unsafe_allow_html=True,
         )
 
-    # -- Current config summary --
+    # -- Quick Config Shortcuts --
     model_name = _get_model_display_name()
     template_name = _get_template_display_name()
 
-    st.markdown(
-        f"""
-        <div class="card">
-            <div class="card-header">
-                <span class="card-header-icon">{_svg_icon("gear", size="md", extra_class="icon-rotate")}</span>
-                <span class="card-header-title">当前配置</span>
-            </div>
-            <div class="config-info">
-                <div class="config-item">
-                    <div class="config-item-icon">{_svg_icon("chip", size="md")}</div>
-                    <div>
-                        <div class="config-item-label">模型</div>
-                        <div class="config-item-value">{model_name}</div>
-                    </div>
+    col_ai, col_tpl = st.columns(2)
+    with col_ai:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-header-icon">{_svg_icon("chip", size="md")}</span>
+                    <span class="card-header-title">AI 模型</span>
                 </div>
-                <div class="config-item">
-                    <div class="config-item-icon">{_svg_icon("docStack", size="md")}</div>
-                    <div>
-                        <div class="config-item-label">模板</div>
-                        <div class="config-item-value">{template_name}</div>
-                    </div>
+                <div style="padding: 0.6rem 1.2rem 0.2rem;">
+                    <span style="font-size:0.92rem;color:#334155;font-weight:500;">{model_name}</span>
                 </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    col_spacer, col_config_btn = st.columns([4, 1])
-    with col_config_btn:
-        if st.button("⚙️ 修改配置", use_container_width=True, key="btn_modify_config"):
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("⚙️ 修改模型配置", use_container_width=True, key="btn_quick_ai"):
             st.session_state.current_page = "settings"
+            st.rerun()
+
+    with col_tpl:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-header-icon">{_svg_icon("doc", size="md")}</span>
+                    <span class="card-header-title">报告模板</span>
+                </div>
+                <div style="padding: 0.6rem 1.2rem 0.2rem;">
+                    <span style="font-size:0.92rem;color:#334155;font-weight:500;">{template_name}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("📋 管理模板", use_container_width=True, key="btn_quick_tpl"):
+            st.session_state.current_page = "template"
             st.rerun()
 
     # -- Generate button & Report --
@@ -2343,7 +2794,6 @@ def main_page():
                 status_text = st.empty()
 
                 # 使用队列在子线程和主线程之间传递进度
-                import queue
                 progress_queue = queue.Queue()
 
                 def _update_progress(current: int, total: int) -> None:
@@ -2361,9 +2811,31 @@ def main_page():
                     import threading
                     analysis_result = {"analyses": None, "error": None}
 
+                    # 获取历史快照中的旧文件内容（用于增量分析）
+                    _snapshot = get_latest_snapshot()
+                    _old_file_contents = get_snapshot_file_contents(_snapshot)
+                    logger.info(
+                        "从快照中获取了 %d 个文件的旧内容用于增量分析",
+                        len(_old_file_contents),
+                    )
+
                     def _run_analysis():
                         try:
-                            analysis_result["analyses"] = analyze_all_files(files, provider, _update_progress)
+                            # 使用增量分析：对比新旧内容，只分析变更部分
+                            analyses_list = []
+                            total = len(files_to_analyze)
+                            for idx, file_info in enumerate(files_to_analyze):
+                                file_path = file_info.get("path", "")
+                                old_content = _old_file_contents.get(file_path)
+                                new_content = read_file(file_path)
+                                # 跳过读取失败的文件
+                                if new_content.startswith("[Error]") or new_content.startswith("[Skipped]"):
+                                    logger.warning("跳过无法读取的文件: %s", file_path)
+                                    old_content = None
+                                result = analyze_changes(file_info, provider, old_content, new_content)
+                                analyses_list.append(result)
+                                _update_progress(idx + 1, total)
+                            analysis_result["analyses"] = analyses_list
                         except Exception as e:
                             analysis_result["error"] = e
 
@@ -2395,15 +2867,78 @@ def main_page():
                     with st.spinner("正在生成工作汇总..."):
                         week_range = get_week_range(days=scan_days)
                         template_name = st.session_state.selected_template
+                        
+                        # 获取历史报告用于增量对比
+                        previous_report = None
+                        latest_snapshot = get_latest_snapshot()
+                        if latest_snapshot and latest_snapshot.get("report"):
+                            previous_report = latest_snapshot["report"]
+                            logger.info("使用历史快照进行增量对比: %s", latest_snapshot.get("id", ""))
+                        
+                        # 计算内容级文件变更摘要（新增/删除行数）
+                        file_changes_line_stats = {}
+                        for file_info in files_to_analyze:
+                            file_path = file_info.get("path", "")
+                            old_content = _old_file_contents.get(file_path)
+                            new_content = read_file(file_path)
+                            if new_content.startswith("[Error]") or new_content.startswith("[Skipped]"):
+                                continue
+                            diff = get_file_diff(old_content or "", new_content)
+                            if diff["has_changes"]:
+                                file_changes_line_stats[file_path] = {
+                                    "added_lines": len(diff["added_lines"]),
+                                    "removed_lines": len(diff["removed_lines"]),
+                                    "change_summary": diff["change_summary"],
+                                }
+                        
+                        # 合并文件级变更信息和行级变更统计
+                        file_changes = st.session_state.file_changes or {}
+                        file_changes["line_stats"] = file_changes_line_stats
+                        
                         report = generate_report(
                             analyses,
                             provider,
                             week_range=week_range,
                             template_name=template_name,
+                            previous_report=previous_report,
+                            file_changes=file_changes,
                         )
 
                     st.session_state.report = report
                     st.success("✅ 工作汇总生成完成！")
+                    
+                    # 显示内容级变更统计
+                    if file_changes_line_stats:
+                        total_added = sum(s["added_lines"] for s in file_changes_line_stats.values())
+                        total_removed = sum(s["removed_lines"] for s in file_changes_line_stats.values())
+                        changed_file_count = len(file_changes_line_stats)
+                        if total_added > 0 or total_removed > 0:
+                            stats_parts = []
+                            if total_added > 0:
+                                stats_parts.append(f"新增 **{total_added}** 行")
+                            if total_removed > 0:
+                                stats_parts.append(f"删除 **{total_removed}** 行")
+                            stats_text = "，".join(stats_parts)
+                            st.info(f"📊 内容变更统计（{changed_file_count} 个文件）：{stats_text}")
+                    
+                    if previous_report:
+                        st.info("📝 已基于历史记录生成增量工作汇总，重点突出新增和修改的内容")
+                    
+                    # 保存快照到历史记录
+                    if st.session_state.save_snapshot_on_generate:
+                        snapshot_id = save_snapshot(
+                            files=files_to_analyze,
+                            analyses=analyses,
+                            report=report,
+                            metadata={
+                                "scan_days": scan_days,
+                                "work_dir": work_dir,
+                                "template": template_name,
+"retention_days": st.session_state.get("retention_days", 30),
+                            }
+                        )
+                        if snapshot_id:
+                            logger.info("已保存快照: %s", snapshot_id)
 
                 except ValueError as exc:
                     st.error(f"配置错误: {exc}")
@@ -2417,7 +2952,7 @@ def main_page():
                 <div class="card">
                     <div style="text-align: center; padding: 1rem 0;">
                         <div style="margin-bottom: 0.5rem;">{_svg_icon("warning", size="xl", extra_class="icon-glow-warning")}</div>
-                        <div style="font-size: 0.95rem; color: var(--neutral-600); font-weight: 500;">
+                        <div style="font-size: 0.95rem; color: #475569; font-weight: 500;">
                             请先配置AI模型才能生成工作汇总
                         </div>
                     </div>
@@ -2517,8 +3052,631 @@ def main_page():
 # Page: Settings (设置页面)
 # ---------------------------------------------------------------------------
 
+
+def _render_test_connection_button(source_key: str, btn_key: str) -> None:
+    """Render a test-connection button with status feedback for *source_key*.
+
+    Reads and writes ``st.session_state.source_connection_status[source_key]``.
+    """
+    status = st.session_state.source_connection_status.get(source_key)
+    col_btn, col_status = st.columns([1, 2])
+
+    with col_btn:
+        if st.button("🔗 测试连接", key=btn_key, use_container_width=True):
+            with st.spinner("正在测试连接..."):
+                ok, msg = _test_datasource_connection(source_key)
+            st.session_state.source_connection_status[source_key] = {
+                "ok": ok,
+                "msg": msg,
+            }
+            st.rerun()
+
+    with col_status:
+        if status:
+            if status["ok"]:
+                st.success(f"✅ {status['msg']}")
+            else:
+                st.error(f"❌ {status['msg']}")
+
+
+def template_page():
+    """模板管理页面 - 管理内置模板和自定义模板。"""
+
+    # -- Hero Banner --
+    _hero_doc = _svg_icon("docStack", size="lg", extra_class="hero-icon icon-glow-white")
+    st.markdown(
+        f"""
+        <div class="hero-banner">
+            <div class="hero-badge">{_svg_icon("sparkle", size="xs")} 模板中心</div>
+            <h1>{_hero_doc} 模板管理</h1>
+            <p>管理内置模板和自定义模板，打造专属周报风格</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 返回主页按钮
+    if st.button("← 返回主页", use_container_width=True):
+        st.session_state.current_page = "main"
+        st.rerun()
+
+    # -- Tabs --
+    tab_builtin, tab_custom = st.tabs(["📦 内置模板", "✏️ 自定义模板"])
+
+    # === Tab 1: Built-in Templates ===
+    with tab_builtin:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-header-icon">{_svg_icon("docStack", size="md")}</span>
+                    <span class="card-header-title">内置模板</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        all_templates = list_templates()
+        builtin_keys = ["standard", "concise", "detailed"]
+        builtin_templates = {
+            k: v for k, v in all_templates.items() if k in builtin_keys
+        }
+
+        # Template metadata for display
+        template_meta = {
+            "standard": {"icon": "📄", "label": "标准模板", "color": "#3b82f6"},
+            "concise": {"icon": "📝", "label": "简洁模板", "color": "#10b981"},
+            "detailed": {"icon": "📚", "label": "详细模板", "color": "#8b5cf6"},
+        }
+
+        if builtin_templates:
+            for key, data in builtin_templates.items():
+                meta = template_meta.get(key, {"icon": "📄", "label": key, "color": "#6b7280"})
+                with st.expander(f"{meta['icon']} {data['name']}", expanded=False):
+                    # Description
+                    st.markdown(f"**描述：** {data.get('description', '暂无描述')}")
+
+                    # Sections
+                    sections = data.get("sections", [])
+                    if sections:
+                        sections_text = "、".join(sections)
+                        st.markdown(f"**包含章节：** {sections_text}")
+
+                    # Created date
+                    created_at = data.get("created_at", "未知")
+                    st.caption(f"创建日期：{created_at}")
+
+                    # Preview button
+                    if st.button(f"👁️ 预览模板内容", key=f"preview_{key}", use_container_width=True):
+                        st.session_state[f"show_preview_{key}"] = True
+
+                    # Show preview if toggled
+                    if st.session_state.get(f"show_preview_{key}", False):
+                        st.divider()
+                        st.markdown("**模板内容预览：**")
+                        template_content = data.get("template", "")
+                        st.code(template_content, language="markdown")
+                        if st.button("收起预览", key=f"hide_preview_{key}"):
+                            st.session_state[f"show_preview_{key}"] = False
+                            st.rerun()
+
+                    # Select as active template
+                    current_tpl = st.session_state.get("selected_template")
+                    is_selected = current_tpl == key
+                    if is_selected:
+                        st.success("✅ 当前正在使用此模板")
+                    else:
+                        if st.button(f"📌 使用此模板", key=f"use_{key}", use_container_width=True):
+                            st.session_state.selected_template = key
+                            st.success(f"已切换到 {data['name']}")
+                            st.rerun()
+        else:
+            st.warning("未找到内置模板，请检查 templates/builtin 目录")
+
+    # === Tab 2: Custom Templates ===
+    with tab_custom:
+        st.markdown(
+            f"""
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-header-icon">{_svg_icon("docDark", size="md")}</span>
+                    <span class="card-header-title">自定义模板</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # -- Section 1: Upload and Extract Template --
+        st.markdown(
+            f'<div class="settings-section-title">{_svg_icon("folder", size="md")} 从文件提取模板</div>',
+            unsafe_allow_html=True,
+        )
+
+        uploaded_file = st.file_uploader(
+            "上传周报文件",
+            type=["md", "txt", "docx", "pdf"],
+            help="上传一份现有的周报，系统将自动提取模板结构（支持 .md, .txt, .docx, .pdf 格式）",
+            key="template_upload",
+        )
+
+        if uploaded_file is not None:
+            # Read uploaded file content based on file type
+            file_ext = Path(uploaded_file.name).suffix.lower()
+
+            if file_ext in ['.md', '.txt']:
+                file_content = uploaded_file.read().decode("utf-8")
+            elif file_ext in ['.docx', '.pdf']:
+                import tempfile
+                suffix = file_ext
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(uploaded_file.read())
+                    tmp_path = tmp.name
+                from core.template_manager import read_file_content
+                file_content = read_file_content(tmp_path)
+                Path(tmp_path).unlink()
+            else:
+                st.error("不支持的文件格式")
+                file_content = ""
+
+            if file_content:
+                # Show preview
+                with st.expander("📄 预览上传内容", expanded=False):
+                    preview_text = file_content[:500] + "..." if len(file_content) > 500 else file_content
+                    st.text(preview_text)
+
+                template_name_input = st.text_input(
+                    "模板名称",
+                    value="",
+                    placeholder="输入模板名称，如：我的周报模板",
+                    help="为提取的模板命名",
+                    key="extract_template_name",
+                )
+
+                # LLM analysis option
+                use_llm_analysis = st.toggle(
+                    "🤖 使用 AI 智能分析模板",
+                    value=True,
+                    help="使用 AI 分析模板结构，生成更优化的提示词模板",
+                    key="use_llm_toggle",
+                )
+
+                if st.button("📥 提取模板", use_container_width=True, key="extract_btn"):
+                    if not template_name_input.strip():
+                        st.error("请输入模板名称")
+                    else:
+                        with st.spinner("正在提取模板..."):
+                            if use_llm_analysis:
+                                # 使用 LLM 分析模板
+                                from core.template_manager import analyze_template_with_llm
+
+                                # 获取 LLM provider
+                                provider = None
+                                config_mode = st.session_state.get("config_mode", "使用 .env 配置")
+                                selected_provider_key = st.session_state.get("selected_provider_key")
+
+                                if config_mode == "使用 .env 配置" and selected_provider_key:
+                                    try:
+                                        provider = create_provider(selected_provider_key)
+                                    except Exception as e:
+                                        st.warning(f"无法创建 LLM provider: {e}，将使用基础提取")
+                                elif config_mode == "手动配置":
+                                    base_url = st.session_state.get("manual_base_url", "")
+                                    api_key = st.session_state.get("manual_api_key", "")
+                                    model_name = st.session_state.get("manual_model_name", "")
+                                    if base_url and model_name:
+                                        try:
+                                            provider = CustomProvider(
+                                                api_key=api_key,
+                                                model=model_name,
+                                                base_url=base_url,
+                                            )
+                                        except Exception as e:
+                                            st.warning(f"无法创建 LLM provider: {e}，将使用基础提取")
+
+                                if provider:
+                                    template_data = analyze_template_with_llm(
+                                        file_content, provider, template_name_input.strip()
+                                    )
+                                    st.info("✨ AI 已分析模板结构并生成优化的提示词")
+                                else:
+                                    # 回退到基础提取
+                                    template_data = extract_template_from_report(
+                                        file_content, template_name_input.strip()
+                                    )
+                            else:
+                                # 使用基础提取
+                                template_data = extract_template_from_report(
+                                    file_content, template_name_input.strip()
+                                )
+
+                            success = save_custom_template(
+                                template_name_input.strip(), template_data
+                            )
+
+                        if success:
+                            st.success(f"模板 '{template_name_input}' 提取并保存成功！")
+
+                            # 显示分析结果
+                            if use_llm_analysis and "analysis" in template_data:
+                                with st.expander("📊 AI 分析结果", expanded=True):
+                                    st.markdown(template_data["analysis"])
+
+                            st.rerun()
+                        else:
+                            st.error("模板保存失败")
+
+        st.divider()
+
+        # -- Section 2: Existing Custom Templates --
+        st.markdown(
+            f'<div class="settings-section-title">{_svg_icon("docDark", size="md")} 已保存的自定义模板</div>',
+            unsafe_allow_html=True,
+        )
+
+        all_templates = list_templates()
+        custom_templates = {
+            k: v for k, v in all_templates.items()
+            if k not in ["standard", "concise", "detailed"]
+        }
+
+        if custom_templates:
+            for key, data in custom_templates.items():
+                with st.expander(f"📝 {data['name']}", expanded=False):
+                    # Description
+                    description = data.get("description", "暂无描述")
+                    st.markdown(f"**描述：** {description}")
+
+                    # Sections
+                    sections = data.get("sections", [])
+                    if sections:
+                        sections_text = "、".join(sections)
+                        st.markdown(f"**包含章节：** {sections_text}")
+
+                    # Created date
+                    created_at = data.get("created_at", "未知")
+                    st.caption(f"创建日期：{created_at}")
+
+                    # Preview
+                    template_content = data.get("template", "")
+                    if template_content:
+                        st.markdown("**👁️ 预览模板内容：**")
+                        st.code(template_content, language="markdown")
+
+                    # Action buttons
+                    col_use, col_delete = st.columns(2)
+                    with col_use:
+                        current_tpl = st.session_state.get("selected_template")
+                        is_selected = current_tpl == key
+                        if is_selected:
+                            st.success("✅ 当前使用中")
+                        else:
+                            if st.button(f"📌 使用此模板", key=f"use_custom_{key}", use_container_width=True):
+                                st.session_state.selected_template = key
+                                st.success(f"已切换到 {data['name']}")
+                                st.rerun()
+                    with col_delete:
+                        if st.button(f"🗑️ 删除", key=f"del_custom_{key}", use_container_width=True):
+                            delete_custom_template(key)
+                            st.success(f"已删除模板 '{data['name']}'")
+                            st.rerun()
+        else:
+            st.info("暂无自定义模板，请从文件提取或上传创建")
+
+
+def history_page():
+    """历史记录页面 - 管理历史快照和文件变更。"""
+    
+    # -- Hero Banner --
+    _hero_clock = _svg_icon("clock", size="lg", extra_class="hero-icon icon-glow-white")
+    st.markdown(
+        f"""
+        <div class="hero-banner">
+            <div class="hero-badge">{_svg_icon("sparkle", size="xs")} 历史追踪</div>
+            <h1>{_hero_clock} 历史记录</h1>
+            <p>管理历史快照，追踪文件变更，对比不同版本</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    # 返回主页按钮
+    if st.button("← 返回主页", use_container_width=True):
+        st.session_state.current_page = "main"
+        st.rerun()
+    
+    # ── 概览统计 ──────────────────────────────────────────────────
+    summary = get_timeline_summary()
+    _total = summary.get("total_snapshots", 0)
+    _latest = summary.get("latest_time")
+    _oldest = summary.get("oldest_time")
+    
+    try:
+        _latest_display = _latest[:16].replace("T", " ") if _latest else "无"
+    except Exception:
+        _latest_display = str(_latest) if _latest else "无"
+    try:
+        _oldest_display = _oldest[:16].replace("T", " ") if _oldest else "无"
+    except Exception:
+        _oldest_display = str(_oldest) if _oldest else "无"
+    
+    st.markdown(
+        f"""
+        <div class="card">
+            <div class="card-header">
+                <span class="card-header-icon">{_svg_icon("chart", size="md")}</span>
+                <span class="card-header-title">概览</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    _m1, _m2, _m3 = st.columns(3)
+    with _m1:
+        st.metric("总快照数", _total)
+    with _m2:
+        st.metric("最近快照", _latest_display)
+    with _m3:
+        st.metric("最早快照", _oldest_display)
+    
+    # ── 快照列表 ──────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div class="card" style="margin-top:1rem;">
+            <div class="card-header">
+                <span class="card-header-icon">{_svg_icon("clock", size="md")}</span>
+                <span class="card-header-title">历史快照</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    # 获取历史快照列表
+    snapshots = list_snapshots(limit=20)
+    
+    if not snapshots:
+        st.markdown(
+            f"""
+            <div class="empty-state">
+                <div class="empty-state-icon">{_svg_icon("inbox", size="2xl", extra_class="icon-glow-soft")}</div>
+                <div class="empty-state-text">暂无历史记录</div>
+                <div style="font-size:0.85rem;color:#64748B;margin-top:0.5rem;">
+                    生成报告时会自动保存快照，用于追踪文件变更
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+    
+    # 显示快照列表
+    for idx, snapshot in enumerate(snapshots):
+        snapshot_id = snapshot.get("id", "")
+        timestamp = snapshot.get("timestamp", "")
+        files_count = len(snapshot.get("files", []))
+        analyses_count = len(snapshot.get("analyses", []))
+        metadata = snapshot.get("metadata", {})
+        scan_days = metadata.get("scan_days", 7)
+        work_dir = metadata.get("work_dir", "")
+        
+        # 格式化时间显示
+        try:
+            dt = datetime.fromisoformat(timestamp)
+            time_display = dt.strftime("%Y-%m-%d %H:%M")
+            relative_time = _get_relative_time(dt)
+        except:
+            time_display = timestamp[:19] if timestamp else "未知"
+            relative_time = ""
+        
+        # 构建快照卡片
+        with st.expander(f"📸 {time_display} ({relative_time}) · {files_count} 个文件", expanded=(idx == 0)):
+            # 快照信息
+            st.markdown(
+                f"""
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:1rem;">
+                    <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                        <div style="font-size:0.78rem;color:#64748B;">扫描天数</div>
+                        <div style="font-size:1.1rem;font-weight:600;color:#1E293B;">{scan_days} 天</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                        <div style="font-size:0.78rem;color:#64748B;">文件数量</div>
+                        <div style="font-size:1.1rem;font-weight:600;color:#1E293B;">{files_count} 个</div>
+                    </div>
+                    <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                        <div style="font-size:0.78rem;color:#64748B;">分析结果</div>
+                        <div style="font-size:1.1rem;font-weight:600;color:#1E293B;">{analyses_count} 条</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            
+            # 文件列表
+            if files_count > 0:
+                st.markdown("**📄 文件列表：**")
+                for file_info in snapshot.get("files", [])[:10]:  # 只显示前10个
+                    st.markdown(
+                        f"- {file_info.get('name', '')} ({file_info.get('modified', '')})"
+                    )
+                if files_count > 10:
+                    st.caption(f"... 还有 {files_count - 10} 个文件")
+            
+            # 操作按钮
+            col_delete, col_compare = st.columns([1, 1])
+            with col_delete:
+                if st.button(f"🗑️ 删除", key=f"del_snapshot_{snapshot_id}", use_container_width=True):
+                    if delete_snapshot(snapshot_id):
+                        st.success("快照已删除")
+                        st.rerun()
+                    else:
+                        st.error("删除失败")
+            with col_compare:
+                if st.button(f"📊 与当前比较", key=f"compare_{snapshot_id}", use_container_width=True):
+                    # 获取当前文件列表
+                    current_files = st.session_state.files
+                    if current_files:
+                        # 构建旧文件哈希映射
+                        old_hashes = {}
+                        for file_info in snapshot.get("files", []):
+                            old_hashes[file_info.get("path", "")] = file_info.get("hash", "")
+                        
+                        # 比较变更（直接实现，不依赖已移除的函数）
+                        new_hashes = {}
+                        for file_info in current_files:
+                            file_path = file_info.get("path", "")
+                            new_hashes[file_path] = get_file_hash(file_path)
+                        
+                        added = []
+                        modified = []
+                        unchanged = []
+                        for file_info in current_files:
+                            file_path = file_info.get("path", "")
+                            if file_path not in old_hashes:
+                                added.append(file_info)
+                            elif old_hashes[file_path] != new_hashes.get(file_path):
+                                modified.append(file_info)
+                            else:
+                                unchanged.append(file_info)
+                        
+                        removed = []
+                        for old_file in snapshot.get("files", []):
+                            old_path = old_file.get("path", "")
+                            if old_path not in new_hashes:
+                                removed.append(old_file)
+                        
+                        changes = {
+                            "added": added,
+                            "modified": modified,
+                            "removed": removed,
+                            "unchanged": unchanged,
+                        }
+                        
+                        st.session_state.file_changes = changes
+                        
+                        # 显示比较结果（不在 expander 内部显示嵌套 expander）
+                        st.markdown("---")
+                        st.markdown(f"**📊 与快照 {snapshot_id} 的比较结果**")
+                        
+                        added = changes.get("added", [])
+                        modified = changes.get("modified", [])
+                        removed = changes.get("removed", [])
+                        
+                        col_a, col_m, col_r = st.columns(3)
+                        with col_a:
+                            st.metric("新增文件", len(added))
+                        with col_m:
+                            st.metric("修改文件", len(modified))
+                        with col_r:
+                            st.metric("删除文件", len(removed))
+                        
+                        # 显示详细变更列表（使用 markdown 而非嵌套 expander）
+                        if added:
+                            st.markdown(f"**✅ 新增文件 ({len(added)}):**")
+                            for f in added[:5]:  # 只显示前5个
+                                st.markdown(f"- {f.get('name', '')} ({f.get('relative', '')})")
+                            if len(added) > 5:
+                                st.caption(f"... 还有 {len(added) - 5} 个文件")
+                        
+                        if modified:
+                            st.markdown(f"**📝 修改文件 ({len(modified)}):**")
+                            for f in modified[:5]:
+                                st.markdown(f"- {f.get('name', '')} ({f.get('relative', '')})")
+                            if len(modified) > 5:
+                                st.caption(f"... 还有 {len(modified) - 5} 个文件")
+                        
+                        if removed:
+                            st.markdown(f"**🗑️ 删除文件 ({len(removed)}):**")
+                            for f in removed[:5]:
+                                st.markdown(f"- {f.get('name', '')}")
+                            if len(removed) > 5:
+                                st.caption(f"... 还有 {len(removed) - 5} 个文件")
+                        
+                        st.success("比较完成！返回主页可查看文件列表中的变更标记")
+                    else:
+                        st.warning("请先扫描文件")
+    
+    # ── 批量操作 ──────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div class="card" style="margin-top:1rem;">
+            <div class="card-header">
+                <span class="card-header-icon">{_svg_icon("gear", size="md")}</span>
+                <span class="card-header-title">批量操作</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    _op1, _op2 = st.columns(2)
+    
+    _export_snapshots = list_snapshots(limit=100)
+    
+    with _op1:
+        if _export_snapshots:
+            _export_json = json.dumps(_export_snapshots, ensure_ascii=False, indent=2, default=str)
+            st.download_button(
+                label="📥 导出全部快照",
+                data=_export_json,
+                file_name=f"snapshots_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        else:
+            st.button("📥 导出全部快照", disabled=True, use_container_width=True)
+            st.caption("暂无可导出的快照")
+    
+    with _op2:
+        if _total > 0 and st.button("📊 导出摘要报告", use_container_width=True):
+            _report_lines = [
+                "# 历史快照摘要报告",
+                f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"- 总快照数: {_total}",
+                f"- 最早快照: {_oldest_display}",
+                f"- 最近快照: {_latest_display}",
+                "",
+                "## 快照列表",
+            ]
+            for _s in _export_snapshots:
+                _sid = _s.get("id", "?")
+                _sts = _s.get("timestamp", "?")
+                _sfc = len(_s.get("files", []))
+                _report_lines.append(f"- [{_sid}] {_sts[:16]} — {_sfc} 个文件")
+            _report_text = "\n".join(_report_lines)
+            st.download_button(
+                label="💾 下载摘要报告",
+                data=_report_text,
+                file_name=f"snapshot_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        elif _total == 0:
+            st.button("📊 导出摘要报告", disabled=True, use_container_width=True)
+            st.caption("暂无快照数据")
+
+
+def _get_relative_time(dt: datetime) -> str:
+    """获取相对时间描述。"""
+    now = datetime.now()
+    diff = now - dt
+    
+    if diff.days > 30:
+        return f"{diff.days // 30} 个月前"
+    elif diff.days > 0:
+        return f"{diff.days} 天前"
+    elif diff.seconds > 3600:
+        return f"{diff.seconds // 3600} 小时前"
+    elif diff.seconds > 60:
+        return f"{diff.seconds // 60} 分钟前"
+    else:
+        return "刚刚"
+
+
 def settings_page():
-    """设置页面 - 模型配置/模板选择/高级设置."""
+    """设置页面 - AI模型/分析参数/系统."""
 
     # -- Hero Banner for Settings --
     _hero_gear = _svg_icon("gear", size="lg", extra_class="hero-icon icon-glow-white icon-rotate")
@@ -2527,23 +3685,24 @@ def settings_page():
         <div class="hero-banner">
             <div class="hero-badge">{_svg_icon("sparkle", size="xs")} 配置中心</div>
             <h1>{_hero_gear} 设置</h1>
-            <p>配置AI模型、周报模板和高级选项</p>
+            <p>配置AI模型、分析参数和系统选项</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     # -- Tabs for settings sections --
-    tab_model, tab_template, tab_advanced = st.tabs([
-        "🤖 模型配置",
-        "📄 模板选择",
-        "🔧 高级设置",
+    tab_model, tab_analysis, tab_auto_scan, tab_system = st.tabs([
+        "🤖 AI模型",
+        "📊 分析参数",
+        "🔄 自动扫描",
+        "⚙️ 系统",
     ])
 
-    # === Tab 1: Model Configuration ===
+    # === Tab 1: AI模型 ===
     with tab_model:
         st.markdown(
-            f'<div class="settings-section-title">{_svg_icon("chip", size="md")} 模型配置</div>',
+            f'<div class="settings-section-title">{_svg_icon("chip", size="md")} AI模型配置</div>',
             unsafe_allow_html=True,
         )
 
@@ -2656,152 +3815,10 @@ def settings_page():
             except Exception as e:
                 st.error(f"连接失败: {e}")
 
-    # === Tab 2: Template Selection ===
-    with tab_template:
+    # === Tab 2: 分析参数 ===
+    with tab_analysis:
         st.markdown(
-            f'<div class="settings-section-title">{_svg_icon("docStack", size="md")} 模板选择</div>',
-            unsafe_allow_html=True,
-        )
-
-        template_mode = st.selectbox(
-            "选择模板方式",
-            options=["使用内置模板", "上传自定义模板"],
-            index=0,
-            help="选择使用内置模板或从现有周报提取自定义模板",
-        )
-
-        if template_mode == "使用内置模板":
-            # Load builtin templates
-            all_templates = list_templates()
-            builtin_names = {
-                k: v["name"] for k, v in all_templates.items()
-                if k in ["standard", "concise", "detailed"]
-            }
-
-            if builtin_names:
-                template_options = list(builtin_names.values())
-
-                # Determine current index
-                current_tpl = st.session_state.get("selected_template")
-                current_idx = 0
-                if current_tpl and current_tpl in builtin_names:
-                    current_idx = list(builtin_names.keys()).index(current_tpl)
-
-                selected_display = st.selectbox(
-                    "选择模板风格",
-                    options=template_options,
-                    index=current_idx,
-                    help="选择周报的模板风格",
-                )
-                # Find the key for selected display name
-                for key, display in builtin_names.items():
-                    if display == selected_display:
-                        st.session_state.selected_template = key
-                        break
-            else:
-                st.warning("未找到内置模板")
-
-        else:  # 上传自定义模板
-            uploaded_file = st.file_uploader(
-                "上传周报文件",
-                type=["md", "txt", "docx", "pdf"],
-                help="上传一份现有的周报，系统将自动提取模板结构（支持 .md, .txt, .docx, .pdf 格式）",
-            )
-
-            if uploaded_file is not None:
-                # Read uploaded file content based on file type
-                file_ext = Path(uploaded_file.name).suffix.lower()
-                
-                if file_ext in ['.md', '.txt']:
-                    file_content = uploaded_file.read().decode("utf-8")
-                elif file_ext == '.docx':
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
-                        tmp.write(uploaded_file.read())
-                        tmp_path = tmp.name
-                    from core.template_manager import read_file_content
-                    file_content = read_file_content(tmp_path)
-                    Path(tmp_path).unlink()
-                elif file_ext == '.pdf':
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                        tmp.write(uploaded_file.read())
-                        tmp_path = tmp.name
-                    from core.template_manager import read_file_content
-                    file_content = read_file_content(tmp_path)
-                    Path(tmp_path).unlink()
-                else:
-                    st.error("不支持的文件格式")
-                    file_content = ""
-
-                # Show preview
-                with st.expander("预览上传内容", expanded=False):
-                    st.text(file_content[:500] + "..." if len(file_content) > 500 else file_content)
-
-                template_name_input = st.text_input(
-                    "模板名称",
-                    value="",
-                    placeholder="输入模板名称，如：我的周报模板",
-                    help="为提取的模板命名",
-                )
-
-                if st.button("提取模板", use_container_width=True):
-                    if not template_name_input.strip():
-                        st.error("请输入模板名称")
-                    else:
-                        with st.spinner("正在提取模板..."):
-                            template_data = extract_template_from_report(
-                                file_content, template_name_input.strip()
-                            )
-                            success = save_custom_template(
-                                template_name_input.strip(), template_data
-                            )
-
-                        if success:
-                            st.success(f"模板 '{template_name_input}' 提取并保存成功！")
-                            st.rerun()
-                        else:
-                            st.error("模板保存失败")
-
-            # Show existing custom templates
-            all_templates = list_templates()
-            custom_templates = {
-                k: v for k, v in all_templates.items()
-                if k not in ["standard", "concise", "detailed"]
-            }
-
-            if custom_templates:
-                st.markdown("**已保存的自定义模板：**")
-                for key, data in custom_templates.items():
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.caption(f"{_svg_icon('docDark', size='xs')} {data['name']}")
-                    with col2:
-                        if st.button("删除", key=f"del_{key}"):
-                            delete_custom_template(key)
-                            st.rerun()
-
-                custom_options = list(custom_templates.keys())
-
-                # Determine current index
-                current_tpl = st.session_state.get("selected_template")
-                current_idx = 0
-                if current_tpl and current_tpl in custom_options:
-                    current_idx = custom_options.index(current_tpl)
-
-                selected_custom = st.selectbox(
-                    "选择自定义模板",
-                    options=custom_options,
-                    index=current_idx,
-                    format_func=lambda x: custom_templates[x]["name"],
-                    help="选择已保存的自定义模板",
-                )
-                st.session_state.selected_template = selected_custom
-
-    # === Tab 3: Advanced Settings ===
-    with tab_advanced:
-        st.markdown(
-            f'<div class="settings-section-title">{_svg_icon("wrench", size="md")} 高级设置</div>',
+            f'<div class="settings-section-title">{_svg_icon("chart", size="md")} 分析参数</div>',
             unsafe_allow_html=True,
         )
 
@@ -2829,6 +3846,149 @@ def settings_page():
             help="设置日志输出级别",
         )
         st.session_state.log_level = log_level
+
+    # === Tab 3: 自动扫描 ===
+    with tab_auto_scan:
+        st.markdown(
+            f'<div class="settings-section-title">{_svg_icon("clock", size="md")} 自动扫描设置</div>',
+            unsafe_allow_html=True,
+        )
+
+        auto_scan_enabled = st.toggle(
+            "🔄 启用每日自动扫描",
+            value=st.session_state.get("auto_scan_enabled", False),
+            help="开启后将每天自动扫描文件并生成工作汇总",
+        )
+        st.session_state.auto_scan_enabled = auto_scan_enabled
+
+        if auto_scan_enabled:
+            st.markdown("**⏰ 执行时间设置**")
+
+            col_hour, col_minute = st.columns(2)
+            with col_hour:
+                auto_scan_hour = st.number_input(
+                    "小时",
+                    min_value=0,
+                    max_value=23,
+                    value=st.session_state.get("auto_scan_hour", 9),
+                    help="设置执行时间的小时（0-23）",
+                )
+                st.session_state.auto_scan_hour = auto_scan_hour
+
+            with col_minute:
+                auto_scan_minute = st.number_input(
+                    "分钟",
+                    min_value=0,
+                    max_value=59,
+                    value=st.session_state.get("auto_scan_minute", 0),
+                    help="设置执行时间的分钟（0-59）",
+                )
+                st.session_state.auto_scan_minute = auto_scan_minute
+
+            time_str = f"{auto_scan_hour:02d}:{auto_scan_minute:02d}"
+            st.info(f"✅ 自动扫描已启用，将在每天 {time_str} 执行")
+
+            # 更新调度器配置并启动
+            scheduler = st.session_state.auto_scheduler
+            scheduler.set_callback(auto_scan_callback)
+            scheduler.set_schedule(
+                enabled=True,
+                time_str=time_str,
+            )
+            # 保存扫描配置到文件（供后台线程使用，因为线程无法访问 session_state）
+            scheduler.save_scan_config({
+                "work_dir": st.session_state.get("work_dir", ""),
+                "scan_days": st.session_state.get("scan_days", 7),
+                "selected_template": st.session_state.get("selected_template"),
+                "config_mode": st.session_state.get("config_mode", "使用 .env 配置"),
+                "selected_provider_key": st.session_state.get("selected_provider_key"),
+                "manual_base_url": st.session_state.get("manual_base_url", ""),
+                "manual_api_key": st.session_state.get("manual_api_key", ""),
+                "manual_model_name": st.session_state.get("manual_model_name", ""),
+                "retention_days": st.session_state.get("retention_days", 30),
+            })
+        else:
+            st.info("ℹ️ 自动扫描未启用")
+
+            # 停止调度器
+            scheduler = st.session_state.auto_scheduler
+            scheduler.set_schedule(enabled=False, time_str="09:00")
+
+    # === Tab 4: 系统 ===
+    with tab_system:
+        st.markdown(
+            f'<div class="settings-section-title">{_svg_icon("gear", size="md")} 系统设置</div>',
+            unsafe_allow_html=True,
+        )
+
+        # 快照设置
+        st.markdown(
+            f'<div class="settings-section-title">{_svg_icon("clock", size="md")} 快照与历史</div>',
+            unsafe_allow_html=True,
+        )
+
+        save_snapshot_on_generate = st.toggle(
+            "📸 生成报告时自动保存快照",
+            value=st.session_state.save_snapshot_on_generate,
+            help="每次生成报告时自动保存文件快照，用于变更追踪",
+        )
+        st.session_state.save_snapshot_on_generate = save_snapshot_on_generate
+
+        retention_days = st.number_input(
+            "💾 快照保留天数",
+            min_value=1,
+            max_value=365,
+            value=st.session_state.get("retention_days", 30),
+            help="超过保留天数的历史快照将自动删除",
+            key="retention_days_widget",
+            on_change=lambda: setattr(st.session_state, 'retention_days', st.session_state.retention_days_widget),
+        )
+
+        # 显示历史记录摘要
+        timeline_summary = get_timeline_summary()
+
+        if timeline_summary["total_snapshots"] > 0:
+            st.markdown(
+                f"""
+                <div style="background:rgba(255,255,255,0.65);border-radius:12px;padding:1rem;margin-top:0.5rem;">
+                    <div style="font-size:0.85rem;color:#475569;">
+                        📊 历史记录：共 {timeline_summary["total_snapshots"]} 个快照
+                    </div>
+                    <div style="font-size:0.78rem;color:#64748B;margin-top:0.25rem;">
+                        最近：{timeline_summary["latest_time"][:19] if timeline_summary["latest_time"] else "无"}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if st.button("📜 查看历史记录", use_container_width=True):
+                st.session_state.current_page = "history"
+                st.rerun()
+        else:
+            st.info("📝 暂无历史记录，生成报告时会自动保存")
+
+        st.divider()
+
+        # 导出配置
+        st.markdown(
+            f'<div class="settings-section-title">{_svg_icon("externalLink", size="md")} 导出配置</div>',
+            unsafe_allow_html=True,
+        )
+
+        _export_snapshots = list_snapshots(limit=100)
+        if _export_snapshots:
+            _export_json = json.dumps(_export_snapshots, ensure_ascii=False, indent=2, default=str)
+            st.download_button(
+                label="📥 导出全部快照",
+                data=_export_json,
+                file_name=f"snapshots_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        else:
+            st.button("📥 导出全部快照", disabled=True, use_container_width=True)
+            st.caption("暂无可导出的快照")
 
     # -- Bottom actions --
     st.divider()
@@ -2868,15 +4028,20 @@ with st.sidebar:
 
     st.markdown('<div class="sidebar-section-label">导航</div>', unsafe_allow_html=True)
 
-    col_nav1, col_nav2 = st.columns(2)
-    with col_nav1:
-        main_btn = st.button("📝 主页", use_container_width=True, type="primary" if st.session_state.current_page == "main" else "secondary")
-    with col_nav2:
-        settings_btn = st.button("⚙️ 设置", use_container_width=True, type="primary" if st.session_state.current_page == "settings" else "secondary")
-    
+    main_btn = st.button("📝 主页", use_container_width=True, type="primary" if st.session_state.current_page == "main" else "secondary")
+    template_btn = st.button("📋 模板", use_container_width=True, type="primary" if st.session_state.current_page == "template" else "secondary")
+    history_btn = st.button("🕐 历史", use_container_width=True, type="primary" if st.session_state.current_page == "history" else "secondary")
+    settings_btn = st.button("⚙️ 设置", use_container_width=True, type="primary" if st.session_state.current_page == "settings" else "secondary")
+
     # 处理按钮点击
     if main_btn and st.session_state.current_page != "main":
         st.session_state.current_page = "main"
+        st.rerun()
+    elif template_btn and st.session_state.current_page != "template":
+        st.session_state.current_page = "template"
+        st.rerun()
+    elif history_btn and st.session_state.current_page != "history":
+        st.session_state.current_page = "history"
         st.rerun()
     elif settings_btn and st.session_state.current_page != "settings":
         st.session_state.current_page = "settings"
@@ -2884,9 +4049,22 @@ with st.sidebar:
 
     st.divider()
 
+    # -- Data source status in sidebar --
+    st.markdown('<div class="sidebar-section-label">数据源状态</div>', unsafe_allow_html=True)
+
+    # Local files status
+    _sb_files = st.session_state.files
+    _sb_file_count = len(_sb_files) if (st.session_state.scan_done and _sb_files is not None) else 0
+    _sb_file_icon = "✅" if _sb_file_count > 0 else "⚪"
+    st.markdown(
+        f'<div style="font-size:0.78rem;color:rgba(255,255,255,0.7);padding:0.25rem 0;">'
+        f'{_sb_file_icon} 本地文件: {_sb_file_count} 个</div>',
+        unsafe_allow_html=True,
+    )
+
     st.markdown(
         """
-        <div class="sidebar-section-label">快速指南</div>
+        <div class="sidebar-section-label" style="margin-top: 0.5rem;">快速指南</div>
         <div class="tip-box" style="margin-top: 0.5rem;">
             <div class="tip-box-content">
                 ① 输入工作目录路径<br>
@@ -2902,7 +4080,11 @@ with st.sidebar:
     )
 
 # Render current page
-if st.session_state.current_page == "settings":
+if st.session_state.current_page == "template":
+    template_page()
+elif st.session_state.current_page == "history":
+    history_page()
+elif st.session_state.current_page == "settings":
     settings_page()
 else:
     main_page()

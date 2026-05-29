@@ -373,6 +373,82 @@ def analyze_single_file(file_info: Dict, provider: LLMProvider) -> Dict:
     return _analyze_with_template(file_info, provider, template)
 
 
+def analyze_changes(
+    file_info: Dict,
+    provider: LLMProvider,
+    old_content: Optional[str],
+    new_content: str,
+) -> Dict:
+    """Analyze only the changes between old and new file content.
+
+    For new files (old_content is None), the full new_content is analyzed.
+    For modified files, only the diff between old and new content is analyzed,
+    reducing token usage and focusing on recent work.
+
+    Parameters
+    ----------
+    file_info : dict
+        File metadata dict from file_reader.scan_folder(). Must contain at least
+        'path' (absolute path) and 'name'. May also contain 'relative', 'ext', etc.
+    provider : LLMProvider
+        An initialized LLM provider instance for chat completion.
+    old_content : str or None
+        Previous file content. If None, the file is treated as new and
+        the full new_content is analyzed.
+    new_content : str
+        Current file content.
+
+    Returns
+    -------
+    dict
+        Analysis result with keys:
+        - file_name (str): The file's name.
+        - file_path (str): The file's relative path.
+        - analysis (str): LLM-generated analysis text.
+        - status (str): 'success' or 'error'.
+        - error (str): Error message (only present when status is 'error').
+    """
+    try:
+        template = _load_template()
+    except FileNotFoundError as exc:
+        logger.error("Failed to load prompt template: %s", exc)
+        return _build_error_result(file_info, str(exc))
+
+    # Determine what content to analyze
+    if old_content is None:
+        # New file – analyze full content
+        logger.info("New file detected, analyzing full content: %s", file_info.get("name", ""))
+        content_to_analyze = new_content
+    else:
+        # Modified file – extract only the diff for analysis
+        try:
+            from core.diff_extractor import extract_changes_for_analysis
+        except ImportError:
+            logger.warning(
+                "diff_extractor module not available, falling back to full content analysis"
+            )
+            content_to_analyze = new_content
+        else:
+            file_path = file_info.get("path", "")
+            changes_text = extract_changes_for_analysis(file_path, old_content, new_content)
+
+            if not changes_text or not changes_text.strip():
+                logger.info("No meaningful changes detected in %s", file_path)
+                return _build_success_result(
+                    file_info, "近期无明显改动。"
+                )
+
+            content_to_analyze = changes_text
+            logger.info(
+                "Analyzing diff for %s (%d chars)",
+                file_info.get("name", ""),
+                len(changes_text),
+            )
+
+    # Build messages and call LLM via the existing internal helper
+    return _analyze_with_template(file_info, provider, template, file_content=content_to_analyze)
+
+
 def analyze_all_files(
     files: List[Dict],
     provider: LLMProvider,
@@ -442,16 +518,16 @@ def analyze_all_files(
         file_path = file_info.get("path", "")
         content = file_contents.get(file_path)
         
+        # 检查是否是缓存命中（在调用前检查）
+        if use_cache:
+            cached_result = _get_cached_result(file_path, cache)
+            if cached_result is not None:
+                cache_hits += 1
+        
         result = _analyze_with_template(
             file_info, provider, template, 
             file_content=content, cache=cache
         )
-
-        # Track cache hits
-        if result.get("status") == "success":
-            cached = _get_cached_result(file_path, cache)
-            if cached and cached.get("analysis") == result.get("analysis"):
-                cache_hits += 1
 
         # Update progress
         with progress_lock:

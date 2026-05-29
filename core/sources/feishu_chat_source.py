@@ -156,8 +156,11 @@ class FeishuChatSource(DataSource):
         Raises
         ------
         RuntimeError
-            如果 API 调用失败。
+            如果未授权或 API 调用失败。
         """
+        if not self.user_access_token:
+            raise RuntimeError("未授权，请先完成OAuth授权")
+
         try:
             import lark_oapi as lark
             from lark_oapi.api.im.v1 import (
@@ -404,6 +407,117 @@ class FeishuChatSource(DataSource):
         except Exception as e:
             logger.warning("解析消息失败: %s", str(e))
             return None
+
+    # ------------------------------------------------------------------
+    # OAuth 授权相关方法
+    # ------------------------------------------------------------------
+
+    def get_auth_url(self, redirect_uri: str) -> str:
+        """生成飞书OAuth授权URL。
+
+        Parameters
+        ----------
+        redirect_uri : str
+            授权完成后的回调地址。
+
+        Returns
+        -------
+        str
+            用户需要访问的授权页面 URL。
+        """
+        import urllib.parse
+
+        params = {
+            "app_id": self.app_id,
+            "redirect_uri": redirect_uri,
+            "state": "feishu_chat",
+        }
+        return (
+            "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+            + urllib.parse.urlencode(params)
+        )
+
+    def get_access_token(self, code: str) -> str:
+        """用授权码换取 user_access_token。
+
+        Parameters
+        ----------
+        code : str
+            用户授权后回调中携带的授权码。
+
+        Returns
+        -------
+        str
+            获取到的 user_access_token。
+
+        Raises
+        ------
+        RuntimeError
+            如果换取令牌失败。
+        """
+        import json
+        import urllib.request
+
+        # Step 1: 获取 app_access_token
+        app_token_url = (
+            "https://open.feishu.cn/open-apis/auth/v3/"
+            "app_access_token/internal"
+        )
+        app_token_data = json.dumps(
+            {"app_id": self.app_id, "app_secret": self.app_secret}
+        ).encode("utf-8")
+        app_token_req = urllib.request.Request(
+            app_token_url,
+            data=app_token_data,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        with urllib.request.urlopen(app_token_req) as resp:
+            app_token_result = json.loads(resp.read().decode("utf-8"))
+
+        if app_token_result.get("code", 0) != 0:
+            raise RuntimeError(
+                "获取 app_access_token 失败: "
+                + app_token_result.get("msg", "未知错误")
+            )
+        app_access_token = app_token_result["app_access_token"]
+
+        # Step 2: 用授权码换取 user_access_token
+        user_token_url = (
+            "https://open.feishu.cn/open-apis/authen/v1/"
+            "oidc/access_token"
+        )
+        user_token_data = json.dumps(
+            {"grant_type": "authorization_code", "code": code}
+        ).encode("utf-8")
+        user_token_req = urllib.request.Request(
+            user_token_url,
+            data=user_token_data,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {app_access_token}",
+            },
+        )
+        with urllib.request.urlopen(user_token_req) as resp:
+            user_token_result = json.loads(resp.read().decode("utf-8"))
+
+        if user_token_result.get("code", 0) != 0:
+            raise RuntimeError(
+                "获取 user_access_token 失败: "
+                + user_token_result.get("msg", "未知错误")
+            )
+
+        self.user_access_token = user_token_result["data"]["access_token"]
+        return self.user_access_token
+
+    def is_authorized(self) -> bool:
+        """检查是否已授权（拥有 user_access_token）。
+
+        Returns
+        -------
+        bool
+            如果已持有 user_access_token 则返回 True。
+        """
+        return bool(self.user_access_token)
 
     def is_available(self) -> bool:
         """检查飞书配置是否完整。

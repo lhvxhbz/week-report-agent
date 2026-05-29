@@ -1,36 +1,55 @@
-# 📋 周报终结者 V2.0 - AI驱动的工作汇总工具
+# 📋 周报终结者
 
-> **一句话描述**：智能扫描工作文件，AI自动分析内容变更，生成专业的增量工作汇报
+> **智能扫描工作文件，AI自动分析内容变更，一键生成专业工作汇报**
 
-## ✨ V2.0 核心特性
+一个基于AI的工作汇总工具。扫描你的工作目录，识别近期修改的文件，通过AI分析内容并自动生成结构化的工作周报。支持内容级对比、增量分析、定时自动扫描，让周报撰写从繁琐变为轻松。
 
-### 🆕 V2.0 新增功能
-- 🔄 **内容级对比** - 对比文件具体变更，不只是文件是否修改
-- 📊 **增量分析** - 只分析变更部分，避免重复汇报
-- 🕐 **每日自动扫描** - 定时自动扫描并生成报告
-- 📄 **多格式支持** - 新增PDF和Excel文件读取
-- 🎯 **智能导航** - 主页/模板/历史/设置四页面布局
+## 功能特性
 
-### 📁 核心功能
-- 🔍 **智能文件扫描** - 自动识别近期修改的工作文件（50+文件类型）
-- 🤖 **AI内容分析** - 多模型支持（OpenAI/Claude/百炼/自定义）
-- 📊 **结构化生成** - 自动生成专业的工作汇总
-- 📥 **多格式导出** - 支持Markdown/Word/PDF/TXT
-- 💾 **历史快照** - 保存文件快照，支持变更追踪
+### 文件扫描
+- 自动识别50+种文件类型（代码、文档、配置文件等）
+- 支持PDF文件文本提取
+- 支持Excel文件内容读取
+- 支持Word文档解析
+- 按时间范围筛选（最近N天）
 
-### ⚡ 亮点功能
-- 🚀 **并发处理** - 多线程文件读取和AI分析
-- 💾 **结果缓存** - 避免重复分析，提升效率
-- 📄 **模板系统** - 内置3种模板，支持自定义
-- 🎨 **iOS风格UI** - 毛玻璃材质、流畅动画
+### AI分析
+- 多模型支持：OpenAI、Claude、百炼、自定义API
+- 内容级对比：对比文件具体变更，不只是文件是否修改
+- 增量分析：只分析变更部分，避免重复汇报
+- 并发处理：多线程同时分析多个文件
+- 结果缓存：相同内容不重复分析
 
-## 🚀 快速开始
+### 报告生成
+- 自动生成结构化工作周报
+- 内置3种模板（标准、简洁、详细）
+- 支持自定义模板上传
+- 多格式导出：Markdown、Word、PDF、TXT
+
+### 历史管理
+- 文件快照保存
+- 变更追踪对比
+- 历史报告查看
+
+### 自动化
+- 每日定时自动扫描
+- 后台自动生成报告
+- 可配置执行时间
+
+### 界面设计
+- 四页面布局：主页、模板、历史、设置
+- iOS风格毛玻璃UI
+- 流畅动画交互
+
+## 快速开始
 
 ### 环境要求
-- Python 3.9+
-- 任意LLM API Key
 
-### 安装步骤
+- Python 3.9+
+- 任意LLM API Key（OpenAI/Claude/百炼或自定义）
+
+### 安装
+
 ```bash
 # 克隆项目
 git clone https://github.com/lhvxhbz/week-report-agent.git
@@ -38,156 +57,180 @@ cd week-report-agent
 
 # 安装依赖
 pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env
-# 编辑 .env 填入你的API Key
-
-# 启动应用
-streamlit run app.py
 ```
 
-### 配置说明
+### 配置
+
+```bash
+# 复制配置模板
+cp .env.example .env
+```
+
+编辑 `.env` 文件，填入你的API配置：
+
 ```env
-# 选择模型提供商
+# 选择模型提供商：openai / claude / bailian / custom
 LLM_PROVIDER=custom
 
-# 自定义API配置
+# 自定义API配置（当LLM_PROVIDER=custom时）
 CUSTOM_API_KEY=your-api-key
 CUSTOM_MODEL=your-model-name
 CUSTOM_BASE_URL=https://your-api-endpoint.com/v1
 ```
 
-## 📖 使用指南
+### 启动
+
+```bash
+streamlit run app.py
+```
+
+浏览器会自动打开 `http://localhost:8501`。
+
+## 使用指南
 
 ### 基本流程
-1. **输入工作目录** - 选择要扫描的文件夹路径
-2. **选择扫描天数** - 设置扫描最近N天的文件（默认7天）
-3. **配置AI模型** - 选择或配置AI模型
-4. **生成工作汇总** - 点击按钮，AI自动分析并生成报告
-5. **导出报告** - 选择格式（Markdown/Word/PDF/TXT）并下载
 
-### V2.0 新功能详解
+1. 输入工作目录路径
+2. 选择扫描天数（默认7天）
+3. 选择AI模型和模板
+4. 点击"生成工作汇总"
+5. 等待AI分析完成
+6. 选择导出格式下载报告
 
-#### 🔄 内容级对比
-- 对比文件具体内容变更，不只是文件是否修改
-- 显示新增/删除的行数统计
-- 只分析变更部分，减少重复汇报
+### 内容级对比
 
-#### 🕐 每日自动扫描
-- 在设置页面开启自动扫描功能
-- 设置每天执行时间（精确到分钟）
-- 后台自动执行扫描和报告生成
+开启此功能后，工具会：
+- 读取文件的历史快照
+- 逐行对比内容变更
+- 统计新增/删除行数
+- 只将变更部分发送给AI分析
 
-#### 📄 多格式支持
-- **文本文件**：50+种格式（.py, .js, .ts, .html, .css, .json, .md, .txt等）
-- **Word文档**：.docx格式
-- **PDF文件**：.pdf格式（文本提取）
-- **Excel文件**：.xlsx, .xls格式
+### 增量分析
 
-### 模板选择
-- **标准模板** - 适合日常周报
-- **简洁模板** - 快速汇报
-- **详细模板** - 项目周报
+结合历史快照，只分析：
+- 新增的文件
+- 内容有变更的文件
+- 跳过未修改的文件
 
-### 自定义模板
-支持上传现有的周报文件，自动提取模板结构
+### 每日自动扫描
 
-## 🏗️ 技术架构
+在设置页面：
+1. 开启"每日自动扫描"
+2. 设置执行时间（时:分）
+3. 工具会在指定时间自动执行扫描和报告生成
+
+### 模板使用
+
+**内置模板：**
+- 标准模板：适合日常周报
+- 简洁模板：快速汇报要点
+- 详细模板：项目级详细周报
+
+**自定义模板：**
+上传现有的周报文件，工具会自动提取结构作为模板。
+
+## 技术架构
 
 ### 项目结构
+
 ```
 week-report-agent/
-├── app.py                  # Streamlit主界面（4089行）
+├── app.py                  # Streamlit主界面
 ├── config.py               # 配置管理
+├── requirements.txt        # 依赖列表
+├── .env.example            # 环境变量模板
 ├── core/
-│   ├── file_reader.py      # 文件扫描模块（支持PDF/Excel）
-│   ├── analyzer.py         # 内容分析模块（支持增量分析）
-│   ├── generator.py        # 周报生成模块（支持增量报告）
-│   ├── history.py          # 历史记录模块（快照管理）
-│   ├── diff_extractor.py   # 内容差异提取模块
-│   ├── scheduler.py        # 定时任务调度器
-│   └── template_manager.py # 模板管理模块
+│   ├── file_reader.py      # 文件扫描和读取
+│   ├── analyzer.py         # AI内容分析
+│   ├── generator.py        # 周报生成
+│   ├── history.py          # 历史快照管理
+│   ├── diff_extractor.py   # 内容差异提取
+│   ├── scheduler.py        # 定时任务调度
+│   └── template_manager.py # 模板管理
 ├── llm/
 │   ├── base.py             # LLMProvider基类
 │   ├── openai_provider.py  # OpenAI实现
 │   ├── claude_provider.py  # Claude实现
 │   ├── bailian_provider.py # 百炼实现
-│   ├── custom_provider.py  # 自定义API
+│   ├── custom_provider.py  # 自定义API实现
 │   └── factory.py          # 提供商工厂
-├── templates/              # 模板系统
+├── templates/
 │   ├── builtin/            # 内置模板
-│   └── custom/             # 自定义模板
-└── prompts/                # Prompt模板
+│   └── custom/             # 自定义模板目录
+└── prompts/
     ├── analyze.txt         # 文件分析提示词
     └── generate.txt        # 周报生成提示词
 ```
 
 ### 技术栈
-- **前端**：Streamlit + 自定义CSS（iOS风格）
-- **后端**：Python 3.9+
-- **AI**：OpenAI/Claude/百炼 API
-- **文档处理**：python-docx, PyPDF2, openpyxl
-- **定时任务**：schedule库
 
-### 核心设计
-- **LLM适配层**：统一接口，支持多模型切换
-- **并发处理**：ThreadPoolExecutor多线程优化
-- **缓存机制**：基于文件哈希的结果缓存
-- **增量分析**：对比历史快照，只分析变更部分
-- **模板系统**：JSON格式模板，支持导入导出
+| 组件 | 技术 |
+|------|------|
+| 前端框架 | Streamlit |
+| UI样式 | 自定义CSS（iOS风格） |
+| AI接口 | OpenAI API / Claude API / 百炼 API |
+| 文档处理 | python-docx、PyPDF2、openpyxl |
+| 并发处理 | ThreadPoolExecutor |
+| 定时任务 | schedule |
+| 数据存储 | JSON快照文件 |
 
-## 📊 性能优化
+### 性能优化
 
 | 优化项 | 效果 |
 |--------|------|
-| 并发文件读取 | 4线程并发，提升4倍 |
-| 并发AI分析 | 5线程并发，提升5倍 |
+| 并发文件读取 | 4线程并发 |
+| 并发AI分析 | 5线程并发 |
 | 编码缓存 | 避免重复检测 |
 | 结果缓存 | 二次分析提速90%+ |
-| 增量分析 | 只分析变更部分，减少90%+分析量 |
+| 增量分析 | 减少90%+分析量 |
 
-## 🎯 适用场景
-
-- 👨‍💼 **职场人士** - 每周工作汇报
-- 👩‍💻 **开发者** - 项目进展总结
-- 📊 **产品经理** - 工作成果整理
-- 🎓 **学生** - 学习周报
-- 📝 **自由职业者** - 工作记录和汇报
-
-## 📝 更新日志
+## 更新日志
 
 ### V2.0 (2026-05-29)
-- 🔄 内容级对比 - 对比文件具体变更，不只是文件是否修改
-- 📊 增量分析 - 只分析变更部分，避免重复汇报
-- 🕐 每日自动扫描 - 定时自动扫描并生成报告
-- 📄 多格式支持 - 新增PDF和Excel文件读取
-- 🎯 智能导航 - 主页/模板/历史/设置四页面布局
-- 🧹 代码优化 - 精简代码，移除冗余功能
+
+**新增功能：**
+- 内容级对比：对比文件具体变更内容
+- 增量分析：只分析变更部分，避免重复汇报
+- 每日自动扫描：定时自动执行扫描和报告生成
+- 多格式支持：新增PDF和Excel文件读取
+- 智能导航：主页/模板/历史/设置四页面布局
+
+**优化：**
+- 代码精简和重构
+- 移除冗余功能
 
 ### V1.0 (2026-05-26)
-- ✨ 初始版本发布
-- 🤖 支持多模型LLM
-- 📄 支持多格式导出
-- 🎨 iOS风格UI设计
-- ⚡ 并发性能优化
 
-## 🤝 贡献指南
+- 初始版本发布
+- 多模型LLM支持
+- 多格式导出（Markdown/Word/PDF/TXT）
+- iOS风格UI设计
+- 并发性能优化
+- 历史快照功能
+- 模板系统
 
-欢迎提交Issue和Pull Request！
+## 贡献
 
-## 📄 许可证
+欢迎提交Issue和Pull Request。
+
+1. Fork本仓库
+2. 创建功能分支：`git checkout -b feature/your-feature`
+3. 提交更改：`git commit -m 'Add your feature'`
+4. 推送分支：`git push origin feature/your-feature`
+5. 提交Pull Request
+
+## 许可证
 
 MIT License
 
-## 👨‍💻 作者
+## 作者
 
-- GitHub: [@lhvxhbz](https://github.com/lhvxhbz)
+[@lhvxhbz](https://github.com/lhvxhbz)
 
-## 🙏 致谢
+## 致谢
 
-- [Streamlit](https://streamlit.io/) - Web框架
-- [OpenAI](https://openai.com/) - AI模型
-- [python-docx](https://python-docx.readthedocs.io/) - Word文档处理
-- [PyPDF2](https://pypi.org/project/PyPDF2/) - PDF文档处理
-- [openpyxl](https://pypi.org/project/openpyxl/) - Excel文档处理
+- [Streamlit](https://streamlit.io/)
+- [OpenAI](https://openai.com/)
+- [python-docx](https://python-docx.readthedocs.io/)
+- [PyPDF2](https://pypi.org/project/PyPDF2/)
+- [openpyxl](https://pypi.org/project/openpyxl/)
