@@ -10,6 +10,9 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+# 抑制 Streamlit 的 ScriptRunContext 警告
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+
 import streamlit as st
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,13 @@ from llm.factory import (  # noqa: E402
 )
 from llm.custom_provider import CustomProvider  # noqa: E402
 from core.scheduler import AutoScheduler  # noqa: E402
+from core.report_archive import (  # noqa: E402
+    archive_report,
+    list_archived_reports,
+    get_archived_report,
+    delete_archived_report,
+    get_archive_stats,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2462,6 +2472,20 @@ def auto_scan_callback():
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: snapshot saved {snapshot_id}")
             logger.info("自动扫描: 快照已保存 %s", snapshot_id)
 
+        # 7. 归档周报到历史记录
+        archive_id = archive_report(
+            report_content=report,
+            date_range=week_range,
+            template_name=selected_template,
+            source_files=files,
+            work_dir=work_dir,
+            scan_days=scan_days,
+            metadata={"auto_generated": True},
+        )
+        if archive_id:
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan: report archived {archive_id}")
+            logger.info("自动扫描: 周报已归档 %s", archive_id)
+
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto scan all steps completed successfully")
 
     except Exception as e:
@@ -2940,6 +2964,18 @@ def main_page():
                         if snapshot_id:
                             logger.info("已保存快照: %s", snapshot_id)
 
+                    # 归档周报到历史记录
+                    archive_id = archive_report(
+                        report_content=report,
+                        date_range=week_range,
+                        template_name=template_name,
+                        source_files=files_to_analyze,
+                        work_dir=work_dir,
+                        scan_days=scan_days,
+                    )
+                    if archive_id:
+                        logger.info("周报已归档: %s", archive_id)
+
                 except ValueError as exc:
                     st.error(f"配置错误: {exc}")
                 except FileNotFoundError as exc:
@@ -3366,16 +3402,16 @@ def template_page():
 
 
 def history_page():
-    """历史记录页面 - 管理历史快照和文件变更。"""
+    """历史记录页面 - 周报归档查看与管理。"""
     
     # -- Hero Banner --
     _hero_clock = _svg_icon("clock", size="lg", extra_class="hero-icon icon-glow-white")
     st.markdown(
         f"""
         <div class="hero-banner">
-            <div class="hero-badge">{_svg_icon("sparkle", size="xs")} 历史追踪</div>
+            <div class="hero-badge">{_svg_icon("sparkle", size="xs")} 历史归档</div>
             <h1>{_hero_clock} 历史记录</h1>
-            <p>管理历史快照，追踪文件变更，对比不同版本</p>
+            <p>查看所有已生成的周报归档，点击查看详情</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3386,11 +3422,15 @@ def history_page():
         st.session_state.current_page = "main"
         st.rerun()
     
+    # ── 初始化 session state ──────────────────────────────────────
+    if "history_view_report_id" not in st.session_state:
+        st.session_state.history_view_report_id = None
+    
     # ── 概览统计 ──────────────────────────────────────────────────
-    summary = get_timeline_summary()
-    _total = summary.get("total_snapshots", 0)
-    _latest = summary.get("latest_time")
-    _oldest = summary.get("oldest_time")
+    stats = get_archive_stats()
+    _total = stats.get("total_count", 0)
+    _latest = stats.get("latest_time")
+    _oldest = stats.get("oldest_time")
     
     try:
         _latest_display = _latest[:16].replace("T", " ") if _latest else "无"
@@ -3406,7 +3446,7 @@ def history_page():
         <div class="card">
             <div class="card-header">
                 <span class="card-header-icon">{_svg_icon("chart", size="md")}</span>
-                <span class="card-header-title">概览</span>
+                <span class="card-header-title">归档概览</span>
             </div>
         </div>
         """,
@@ -3415,36 +3455,41 @@ def history_page():
     
     _m1, _m2, _m3 = st.columns(3)
     with _m1:
-        st.metric("总快照数", _total)
+        st.metric("总周报数", _total)
     with _m2:
-        st.metric("最近快照", _latest_display)
+        st.metric("最近生成", _latest_display)
     with _m3:
-        st.metric("最早快照", _oldest_display)
+        st.metric("最早记录", _oldest_display)
     
-    # ── 快照列表 ──────────────────────────────────────────────────
+    # ── 如果正在查看某条周报详情 ──────────────────────────────────
+    if st.session_state.history_view_report_id:
+        _show_report_detail(st.session_state.history_view_report_id)
+        return
+    
+    # ── 周报归档列表 ──────────────────────────────────────────────
     st.markdown(
         f"""
         <div class="card" style="margin-top:1rem;">
             <div class="card-header">
-                <span class="card-header-icon">{_svg_icon("clock", size="md")}</span>
-                <span class="card-header-title">历史快照</span>
+                <span class="card-header-icon">{_svg_icon("doc", size="md")}</span>
+                <span class="card-header-title">周报归档列表</span>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     
-    # 获取历史快照列表
-    snapshots = list_snapshots(limit=20)
+    # 获取归档列表
+    reports = list_archived_reports(limit=50)
     
-    if not snapshots:
+    if not reports:
         st.markdown(
             f"""
             <div class="empty-state">
                 <div class="empty-state-icon">{_svg_icon("inbox", size="2xl", extra_class="icon-glow-soft")}</div>
-                <div class="empty-state-text">暂无历史记录</div>
+                <div class="empty-state-text">暂无周报归档</div>
                 <div style="font-size:0.85rem;color:#64748B;margin-top:0.5rem;">
-                    生成报告时会自动保存快照，用于追踪文件变更
+                    生成周报后会自动归档保存，可在此处查看历史周报
                 </div>
             </div>
             """,
@@ -3452,210 +3497,221 @@ def history_page():
         )
         return
     
-    # 显示快照列表
-    for idx, snapshot in enumerate(snapshots):
-        snapshot_id = snapshot.get("id", "")
-        timestamp = snapshot.get("timestamp", "")
-        files_count = len(snapshot.get("files", []))
-        analyses_count = len(snapshot.get("analyses", []))
-        metadata = snapshot.get("metadata", {})
-        scan_days = metadata.get("scan_days", 7)
-        work_dir = metadata.get("work_dir", "")
+    # 显示周报列表
+    for idx, report_item in enumerate(reports):
+        report_id = report_item.get("report_id", "")
+        created_at = report_item.get("created_at", "")
+        date_range = report_item.get("date_range", "")
+        template_name = report_item.get("template_name", "")
+        summary = report_item.get("summary", "")
+        source_files_count = report_item.get("source_files_count", 0)
         
         # 格式化时间显示
         try:
-            dt = datetime.fromisoformat(timestamp)
-            time_display = dt.strftime("%Y-%m-%d %H:%M")
+            dt = datetime.fromisoformat(created_at)
+            time_display = dt.strftime("%Y-%m-%d %H:%M:%S")
             relative_time = _get_relative_time(dt)
-        except:
-            time_display = timestamp[:19] if timestamp else "未知"
+        except Exception:
+            time_display = created_at[:19] if created_at else "未知"
             relative_time = ""
         
-        # 构建快照卡片
-        with st.expander(f"📸 {time_display} ({relative_time}) · {files_count} 个文件", expanded=(idx == 0)):
-            # 快照信息
+        # 构建标题
+        title_parts = []
+        if date_range:
+            title_parts.append(f"📅 {date_range}")
+        title_parts.append(f"🕐 {time_display}")
+        if relative_time:
+            title_parts.append(f"({relative_time})")
+        
+        title = " · ".join(title_parts)
+        
+        # 使用 expander 展示列表项
+        with st.expander(title, expanded=False):
+            # 摘要信息
             st.markdown(
                 f"""
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-bottom:1rem;">
-                    <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
-                        <div style="font-size:0.78rem;color:#64748B;">扫描天数</div>
-                        <div style="font-size:1.1rem;font-weight:600;color:#1E293B;">{scan_days} 天</div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin-bottom:1rem;">
+                    <div style="background:rgba(255,255,255,0.65);padding:0.6rem;border-radius:8px;">
+                        <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">日期范围</div>
+                        <div style="font-size:0.95rem;font-weight:600;color:#1E293B;">{date_range or '未知'}</div>
                     </div>
-                    <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
-                        <div style="font-size:0.78rem;color:#64748B;">文件数量</div>
-                        <div style="font-size:1.1rem;font-weight:600;color:#1E293B;">{files_count} 个</div>
+                    <div style="background:rgba(255,255,255,0.65);padding:0.6rem;border-radius:8px;">
+                        <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">使用模板</div>
+                        <div style="font-size:0.95rem;font-weight:600;color:#1E293B;">{template_name or '默认'}</div>
                     </div>
-                    <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
-                        <div style="font-size:0.78rem;color:#64748B;">分析结果</div>
-                        <div style="font-size:1.1rem;font-weight:600;color:#1E293B;">{analyses_count} 条</div>
+                    <div style="background:rgba(255,255,255,0.65);padding:0.6rem;border-radius:8px;">
+                        <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">来源文件</div>
+                        <div style="font-size:0.95rem;font-weight:600;color:#1E293B;">{source_files_count} 个</div>
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
             
-            # 文件列表
-            if files_count > 0:
-                st.markdown("**📄 文件列表：**")
-                for file_info in snapshot.get("files", [])[:10]:  # 只显示前10个
-                    st.markdown(
-                        f"- {file_info.get('name', '')} ({file_info.get('modified', '')})"
-                    )
-                if files_count > 10:
-                    st.caption(f"... 还有 {files_count - 10} 个文件")
+            # 摘要文本
+            if summary:
+                st.markdown(f"**摘要：** {summary}")
             
             # 操作按钮
-            col_delete, col_compare = st.columns([1, 1])
+            col_view, col_delete = st.columns([2, 1])
+            with col_view:
+                if st.button(
+                    "📖 查看详情",
+                    key=f"view_report_{report_id}",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    st.session_state.history_view_report_id = report_id
+                    st.rerun()
             with col_delete:
-                if st.button(f"🗑️ 删除", key=f"del_snapshot_{snapshot_id}", use_container_width=True):
-                    if delete_snapshot(snapshot_id):
-                        st.success("快照已删除")
+                if st.button(
+                    "🗑️ 删除",
+                    key=f"del_report_{report_id}",
+                    use_container_width=True,
+                ):
+                    if delete_archived_report(report_id):
+                        st.success("已删除")
                         st.rerun()
                     else:
                         st.error("删除失败")
-            with col_compare:
-                if st.button(f"📊 与当前比较", key=f"compare_{snapshot_id}", use_container_width=True):
-                    # 获取当前文件列表
-                    current_files = st.session_state.files
-                    if current_files:
-                        # 构建旧文件哈希映射
-                        old_hashes = {}
-                        for file_info in snapshot.get("files", []):
-                            old_hashes[file_info.get("path", "")] = file_info.get("hash", "")
-                        
-                        # 比较变更（直接实现，不依赖已移除的函数）
-                        new_hashes = {}
-                        for file_info in current_files:
-                            file_path = file_info.get("path", "")
-                            new_hashes[file_path] = get_file_hash(file_path)
-                        
-                        added = []
-                        modified = []
-                        unchanged = []
-                        for file_info in current_files:
-                            file_path = file_info.get("path", "")
-                            if file_path not in old_hashes:
-                                added.append(file_info)
-                            elif old_hashes[file_path] != new_hashes.get(file_path):
-                                modified.append(file_info)
-                            else:
-                                unchanged.append(file_info)
-                        
-                        removed = []
-                        for old_file in snapshot.get("files", []):
-                            old_path = old_file.get("path", "")
-                            if old_path not in new_hashes:
-                                removed.append(old_file)
-                        
-                        changes = {
-                            "added": added,
-                            "modified": modified,
-                            "removed": removed,
-                            "unchanged": unchanged,
-                        }
-                        
-                        st.session_state.file_changes = changes
-                        
-                        # 显示比较结果（不在 expander 内部显示嵌套 expander）
-                        st.markdown("---")
-                        st.markdown(f"**📊 与快照 {snapshot_id} 的比较结果**")
-                        
-                        added = changes.get("added", [])
-                        modified = changes.get("modified", [])
-                        removed = changes.get("removed", [])
-                        
-                        col_a, col_m, col_r = st.columns(3)
-                        with col_a:
-                            st.metric("新增文件", len(added))
-                        with col_m:
-                            st.metric("修改文件", len(modified))
-                        with col_r:
-                            st.metric("删除文件", len(removed))
-                        
-                        # 显示详细变更列表（使用 markdown 而非嵌套 expander）
-                        if added:
-                            st.markdown(f"**✅ 新增文件 ({len(added)}):**")
-                            for f in added[:5]:  # 只显示前5个
-                                st.markdown(f"- {f.get('name', '')} ({f.get('relative', '')})")
-                            if len(added) > 5:
-                                st.caption(f"... 还有 {len(added) - 5} 个文件")
-                        
-                        if modified:
-                            st.markdown(f"**📝 修改文件 ({len(modified)}):**")
-                            for f in modified[:5]:
-                                st.markdown(f"- {f.get('name', '')} ({f.get('relative', '')})")
-                            if len(modified) > 5:
-                                st.caption(f"... 还有 {len(modified) - 5} 个文件")
-                        
-                        if removed:
-                            st.markdown(f"**🗑️ 删除文件 ({len(removed)}):**")
-                            for f in removed[:5]:
-                                st.markdown(f"- {f.get('name', '')}")
-                            if len(removed) > 5:
-                                st.caption(f"... 还有 {len(removed) - 5} 个文件")
-                        
-                        st.success("比较完成！返回主页可查看文件列表中的变更标记")
-                    else:
-                        st.warning("请先扫描文件")
+
+
+def _show_report_detail(report_id: str):
+    """显示单条周报归档的详细内容。"""
     
-    # ── 批量操作 ──────────────────────────────────────────────────
+    # 返回列表按钮
+    if st.button("← 返回列表", key="back_to_list", use_container_width=True):
+        st.session_state.history_view_report_id = None
+        st.rerun()
+    
+    # 获取周报详情
+    report_data = get_archived_report(report_id)
+    
+    if not report_data:
+        st.error("未找到该周报记录，可能已被删除。")
+        st.session_state.history_view_report_id = None
+        return
+    
+    # 解析数据
+    created_at = report_data.get("created_at", "")
+    date_range = report_data.get("date_range", "")
+    template_name = report_data.get("template_name", "")
+    report_content = report_data.get("report_content", "")
+    source_files_count = report_data.get("source_files_count", 0)
+    source_files_info = report_data.get("source_files_info", [])
+    work_dir = report_data.get("work_dir", "")
+    scan_days = report_data.get("scan_days", 7)
+    export_path = report_data.get("export_path", "")
+    metadata = report_data.get("metadata", {})
+    
+    # 格式化时间
+    try:
+        dt = datetime.fromisoformat(created_at)
+        time_display = dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        time_display = created_at[:19] if created_at else "未知"
+    
+    # ── 元信息卡片 ──────────────────────────────────────────────
+    _icon_doc = _svg_icon("doc", size="md")
     st.markdown(
         f"""
-        <div class="card" style="margin-top:1rem;">
+        <div class="card">
             <div class="card-header">
-                <span class="card-header-icon">{_svg_icon("gear", size="md")}</span>
-                <span class="card-header-title">批量操作</span>
+                <span class="card-header-icon">{_icon_doc}</span>
+                <span class="card-header-title">周报详情</span>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     
-    _op1, _op2 = st.columns(2)
+    # 元信息网格
+    auto_tag = " 🤖 自动生成" if metadata.get("auto_generated") else ""
+    st.markdown(
+        f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:0.75rem;margin-bottom:1.25rem;">
+            <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">生成时间</div>
+                <div style="font-size:0.9rem;font-weight:600;color:#1E293B;">{time_display}{auto_tag}</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">日期范围</div>
+                <div style="font-size:0.9rem;font-weight:600;color:#1E293B;">{date_range or '未指定'}</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">使用模板</div>
+                <div style="font-size:0.9rem;font-weight:600;color:#1E293B;">{template_name or '默认'}</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">来源文件</div>
+                <div style="font-size:0.9rem;font-weight:600;color:#1E293B;">{source_files_count} 个</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">工作目录</div>
+                <div style="font-size:0.9rem;font-weight:600;color:#1E293B;">{work_dir or '未记录'}</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.65);padding:0.75rem;border-radius:8px;">
+                <div style="font-size:0.72rem;color:#64748B;text-transform:uppercase;">扫描天数</div>
+                <div style="font-size:0.9rem;font-weight:600;color:#1E293B;">{scan_days} 天</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
-    _export_snapshots = list_snapshots(limit=100)
+    # ── 周报正文 ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📄 周报正文")
     
-    with _op1:
-        if _export_snapshots:
-            _export_json = json.dumps(_export_snapshots, ensure_ascii=False, indent=2, default=str)
+    if report_content:
+        st.markdown(report_content)
+    else:
+        st.warning("该记录没有保存周报内容。")
+    
+    # ── 来源文件列表 ──────────────────────────────────────────────
+    if source_files_info and isinstance(source_files_info, list) and len(source_files_info) > 0:
+        st.markdown("---")
+        with st.expander(f"📁 来源文件列表（{source_files_count} 个）", expanded=False):
+            for f_info in source_files_info:
+                fname = f_info.get("name", "")
+                frel = f_info.get("relative", "")
+                fext = f_info.get("ext", "")
+                fsize = f_info.get("size", 0)
+                fmod = f_info.get("modified", "")
+                
+                # 格式化文件大小
+                if fsize > 1024 * 1024:
+                    size_str = f"{fsize / 1024 / 1024:.1f} MB"
+                elif fsize > 1024:
+                    size_str = f"{fsize / 1024:.1f} KB"
+                else:
+                    size_str = f"{fsize} B"
+                
+                st.markdown(f"- **{fname}** ({frel}) — {size_str} — 修改于 {fmod}")
+    
+    # ── 导出操作 ──────────────────────────────────────────────────
+    st.markdown("---")
+    col_export_md, col_export_txt = st.columns(2)
+    
+    with col_export_md:
+        if report_content:
             st.download_button(
-                label="📥 导出全部快照",
-                data=_export_json,
-                file_name=f"snapshots_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-        else:
-            st.button("📥 导出全部快照", disabled=True, use_container_width=True)
-            st.caption("暂无可导出的快照")
-    
-    with _op2:
-        if _total > 0 and st.button("📊 导出摘要报告", use_container_width=True):
-            _report_lines = [
-                "# 历史快照摘要报告",
-                f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                f"- 总快照数: {_total}",
-                f"- 最早快照: {_oldest_display}",
-                f"- 最近快照: {_latest_display}",
-                "",
-                "## 快照列表",
-            ]
-            for _s in _export_snapshots:
-                _sid = _s.get("id", "?")
-                _sts = _s.get("timestamp", "?")
-                _sfc = len(_s.get("files", []))
-                _report_lines.append(f"- [{_sid}] {_sts[:16]} — {_sfc} 个文件")
-            _report_text = "\n".join(_report_lines)
-            st.download_button(
-                label="💾 下载摘要报告",
-                data=_report_text,
-                file_name=f"snapshot_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                label="📥 导出 Markdown",
+                data=report_content,
+                file_name=f"周报_{date_range.replace(' ', '').replace('-', '_') if date_range else time_display[:10]}.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
-        elif _total == 0:
-            st.button("📊 导出摘要报告", disabled=True, use_container_width=True)
-            st.caption("暂无快照数据")
+    
+    with col_export_txt:
+        if report_content:
+            st.download_button(
+                label="📥 导出纯文本",
+                data=report_content,
+                file_name=f"周报_{date_range.replace(' ', '').replace('-', '_') if date_range else time_display[:10]}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
 
 def _get_relative_time(dt: datetime) -> str:

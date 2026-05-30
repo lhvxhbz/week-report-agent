@@ -54,3 +54,6 @@ Thumbs.db
 
 # Cache
 .cache/
+
+# Conda Environment
+.conda/

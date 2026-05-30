@@ -9,6 +9,13 @@ from core.template_manager import (
     delete_custom_template,
     extract_template_from_report,
 )
+from core.report_archive import (
+    archive_report,
+    list_archived_reports,
+    get_archived_report,
+    delete_archived_report,
+    get_archive_stats,
+)
 
 __all__ = [
     "scan_folder",
@@ -20,4 +27,9 @@ __all__ = [
     "save_custom_template",
     "delete_custom_template",
     "extract_template_from_report",
+    "archive_report",
+    "list_archived_reports",
+    "get_archived_report",
+    "delete_archived_report",
+    "get_archive_stats",
 ]
