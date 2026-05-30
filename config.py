@@ -1,4 +1,4 @@
-"""Configuration management for 周报终结者."""
+"""Configuration management for X_WorkTrace."""
 
 import os
 from pathlib import Path

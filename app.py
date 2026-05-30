@@ -1,4 +1,4 @@
-"""周报终结者 V1 - Streamlit Web界面."""
+"""X_WorkTrace - Streamlit Web界面."""
 
 import io
 import json
@@ -65,7 +65,7 @@ from core.report_archive import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="周报生成器",
+    page_title="X_WorkTrace",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -2533,7 +2533,7 @@ def main_page():
         f"""
         <div class="hero-banner">
             <div class="hero-badge">{_svg_icon("sparkle", size="xs")} AI 驱动</div>
-            <h1>{_hero_doc} 周报生成器</h1>
+            <h1>{_hero_doc} X_WorkTrace</h1>
             <p>智能扫描工作文件，一键生成专业工作汇总</p>
         </div>
         """,
@@ -4075,8 +4075,8 @@ with st.sidebar:
         f"""
         <div class="sidebar-brand">
             <span class="sidebar-brand-icon">{_sidebar_compass}</span>
-            <div class="sidebar-brand-text">周报终结者</div>
-            <div class="sidebar-brand-sub">Weekly Report Agent</div>
+            <div class="sidebar-brand-text">X_WorkTrace</div>
+            <div class="sidebar-brand-sub">Work Trace Agent</div>
         </div>
         """,
         unsafe_allow_html=True,
